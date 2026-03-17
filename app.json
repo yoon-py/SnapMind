@@ -1,22 +1,49 @@
 {
   "expo": {
-    "name": "Brain Bites",
-    "slug": "brain-bites",
-    "scheme": "brainbites",
+    "name": "SnapMind",
+    "slug": "snapmind",
+    "scheme": "snapmind",
     "version": "1.0.0",
     "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
     "assetBundlePatterns": [
       "**/*"
     ],
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.snapmind.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "사진을 촬영하여 학습 자료로 변환합니다.",
+        "NSPhotoLibraryUsageDescription": "사진을 선택하여 학습 자료로 변환합니다.",
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
+      "package": "com.snapmind.app",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
       "edgeToEdgeEnabled": true
     },
     "web": {
-      "bundler": "metro"
-    }
+      "bundler": "metro",
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-web-browser",
+      "expo-localization"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "993613cd-9b36-4afd-baf6-eb5724a3d315"
+      }
+    },
+    "owner": "kimyoonhwan"
   }
 }
-
