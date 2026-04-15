@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.backend-core.base.json",
+  "compilerOptions": {
+    "outDir": "shared/backend-core/dist/cjs",
+    "module": "CommonJS"
+  }
+}

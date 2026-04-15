@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "rootDir": "shared/backend-core/src",
+    "strict": false,
+    "skipLibCheck": true,
+    "declaration": false,
+    "resolveJsonModule": true,
+    "moduleResolution": "Node",
+    "isolatedModules": false
+  },
+  "include": ["shared/backend-core/src/**/*.ts"]
+}
