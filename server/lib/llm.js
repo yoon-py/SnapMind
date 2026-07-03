@@ -1,6 +1,13 @@
 const OpenAI = require("openai");
 
-const { GEMINI_API_KEY, GEMINI_MODEL, LLM_PROVIDER, model } = require("../config/generation");
+const {
+  GEMINI_API_KEY,
+  GEMINI_MODEL,
+  LLM_BASE_URL,
+  LLM_PROVIDER,
+  LOCAL_LLM_MODEL,
+  model,
+} = require("../config/generation");
 
 function getOpenAIClient() {
   if (!process.env.OPENAI_API_KEY) {
@@ -10,7 +17,65 @@ function getOpenAIClient() {
   return new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 }
 
+// Client for a local / OpenAI-compatible server (Ollama, LM Studio, ...).
+// These servers implement the Chat Completions API rather than the Responses
+// API, and ignore the API key, so a placeholder is fine.
+function getLocalClient() {
+  return new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY || "local",
+    baseURL: LLM_BASE_URL,
+  });
+}
+
+// Runs a prompt against a local OpenAI-compatible model via Chat Completions.
+// Local servers rarely support strict `json_schema` structured outputs, so we
+// use the broadly-supported `json_object` mode and inline the schema into the
+// prompt instead.
+async function generateLocal({ input, max_output_tokens, jsonSchema, fileBuffer }) {
+  if (fileBuffer) {
+    console.warn(
+      "[WARN] LLM_PROVIDER=local does not support file inputs; extract text first. Ignoring file."
+    );
+  }
+
+  let content = input;
+  const params = {
+    model: LOCAL_LLM_MODEL,
+    max_tokens: max_output_tokens || 4096,
+  };
+
+  if (jsonSchema) {
+    params.response_format = { type: "json_object" };
+    content = `${input}\n\nRespond ONLY with valid JSON matching this schema (no markdown, no commentary):\n${JSON.stringify(
+      jsonSchema.schema
+    )}`;
+  }
+
+  params.messages = [{ role: "user", content }];
+
+  const client = getLocalClient();
+  const completion = await client.chat.completions.create(params);
+  const text = completion.choices?.[0]?.message?.content;
+  if (!text) {
+    throw new Error("Local LLM did not return text output.");
+  }
+
+  const finishReason = completion.choices[0].finish_reason;
+  console.log(
+    `Local [${LOCAL_LLM_MODEL}] finish: ${finishReason}, output length: ${text.length} chars`
+  );
+  if (finishReason === "length") {
+    console.warn("[WARN] Local LLM hit token limit - output may be truncated!");
+  }
+
+  return { output_text: text };
+}
+
 async function generateLLM({ input, max_output_tokens, jsonSchema, fileBuffer, fileMimeType }) {
+  if (LLM_PROVIDER === "local") {
+    return generateLocal({ input, max_output_tokens, jsonSchema, fileBuffer });
+  }
+
   if (LLM_PROVIDER === "gemini") {
     if (!GEMINI_API_KEY) {
       throw new Error("GEMINI_API_KEY is missing.");
