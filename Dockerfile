@@ -2,13 +2,14 @@ FROM node:22-bookworm-slim
 
 WORKDIR /app
 
-ENV NODE_ENV=production
-
 COPY package*.json ./
 RUN npm ci
 
 COPY . .
 RUN npm run backend-core:build
+RUN npm prune --omit=dev
+
+ENV NODE_ENV=production
 
 EXPOSE 8788
 

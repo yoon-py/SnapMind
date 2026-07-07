@@ -4,8 +4,9 @@
   "private": true,
   "main": "index.js",
   "scripts": {
-    "start": "expo start",
+    "start": "npm run backend-core:build && node server/index.js",
     "dev": "expo start",
+    "expo:start": "expo start",
     "android": "expo start --android",
     "backend-core:build:cjs": "tsc -p tsconfig.backend-core.cjs.json",
     "backend-core:build:esm": "tsc -p tsconfig.backend-core.esm.json",
