@@ -1,0 +1,14 @@
+node_modules
+web/node_modules
+worker/node_modules
+.expo
+dist
+build
+.git
+.env
+.env.*
+artifacts
+coverage
+*.log
+npm-debug.log*
+.DS_Store
