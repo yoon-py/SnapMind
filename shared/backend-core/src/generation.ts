@@ -3,7 +3,9 @@ import {
   chunkIdeasSchema,
   CHUNK_CHAR_THRESHOLD,
   CHUNK_TARGET_SIZE,
+  getChunkSizeForModel,
   DANISH_STOPWORDS,
+  deckPackSchema,
   ENGLISH_STOPWORDS,
   iconPalette,
   LANGUAGE_PROFILES,
@@ -25,6 +27,17 @@ import {
   slugify,
   trimText,
 } from "./text";
+import {
+  SCENES_JSON_SCHEMA,
+  QUIZ_JSON_SCHEMA,
+  buildScenesInput,
+  buildSceneQuizPrompt,
+  normalizeGeneratedScenesPayload,
+  recomputeSlideStartRatios,
+  parseNumberedTitle as parseSceneNumberedTitle,
+  parseJsonLoose as parseScenesJson,
+  SCENES_SYSTEM_PROMPT,
+} from "./scenesPrompt";
 
 export type JsonSchema = {
   name: string;
@@ -46,7 +59,26 @@ export type ProgressPatch = {
   debug?: unknown;
 };
 
-export type PackFormat = "cards" | "shorts";
+export type PackFormat = "cards" | "shorts" | "deck";
+
+const CARD_TYPES = [
+  "concept",
+  "comparison",
+  "diagram",
+  "interactive",
+  "recall",
+  "quiz",
+  "source_image",
+  "free_image",
+] as const;
+const CARD_MEDIA_KINDS = ["none", "source_image", "free_image", "ai_image"] as const;
+const CARD_DIAGRAM_KINDS = ["none", "comparison", "flow", "formula", "graph", "matrix", "layers"] as const;
+const CARD_INTERACTION_KINDS = ["none", "flip", "toggle", "slider", "order", "fill_blank"] as const;
+
+function pickEnumValue<T extends readonly string[]>(value: unknown, allowed: T, fallback: T[number]) {
+  const normalized = String(value || "").trim().toLowerCase();
+  return (allowed as readonly string[]).includes(normalized) ? (normalized as T[number]) : fallback;
+}
 
 function hasLikelySentenceEnding(text: unknown) {
   return /(?:[.!?。！？]|다\.)["'”’)\]]*$/u.test(String(text || "").trim());
@@ -208,6 +240,147 @@ export function extractSectionHeadingHints(sourceText: string, languageProfile: 
   return sectionHeadingHints;
 }
 
+type NumberedOutlineItem = {
+  number: string;
+  title: string;
+  parentNumber: string;
+  parentTitle: string;
+  level: "major" | "sub";
+  order: number;
+  bodyText: string;
+};
+
+function normalizeOutlineMatchText(text: unknown) {
+  return String(text || "")
+    .toLocaleLowerCase()
+    .replace(/[\s\-—–:.,;!?·()[\]{}'"“”‘’]+/gu, "")
+    .trim();
+}
+
+function parseNumberedOutlineHeading(line: unknown) {
+  const cleaned = normalizeHeadingCandidate(line)
+    .replace(/\s+/g, " ")
+    .trim();
+  const majorMatch = cleaned.match(/^(\d{2})\s+(.{2,80})$/u);
+  if (majorMatch) {
+    const title = majorMatch[2].trim();
+    if (/^of\s+\d+\s*-*$/iu.test(title)) {
+      return null;
+    }
+    return {
+      number: majorMatch[1],
+      title,
+      level: "major" as const,
+    };
+  }
+
+  const subMatch = cleaned.match(/^(\d+(?:\.\d+)+)\s+(.{2,90})$/u);
+  if (subMatch) {
+    return {
+      number: subMatch[1],
+      title: subMatch[2].trim(),
+      level: "sub" as const,
+    };
+  }
+
+  return null;
+}
+
+function lineMatchesOutlineItem(line: string, item: NumberedOutlineItem) {
+  const parsed = parseNumberedOutlineHeading(line);
+  if (parsed?.number === item.number) {
+    return true;
+  }
+
+  const lineNorm = normalizeOutlineMatchText(line);
+  const titleNorm = normalizeOutlineMatchText(item.title);
+  return Boolean(
+    titleNorm &&
+      lineNorm &&
+      (lineNorm === titleNorm || lineNorm.includes(titleNorm) || titleNorm.includes(lineNorm))
+  );
+}
+
+function extractNumberedDocumentOutline(sourceText: string) {
+  const lines = normalizeSourceMaterialText(sourceText)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const ordered: Array<{
+    number: string;
+    title: string;
+    level: "major" | "sub";
+    firstIndex: number;
+  }> = [];
+  const seenNumbers = new Set<string>();
+
+  lines.forEach((line, index) => {
+    const parsed = parseNumberedOutlineHeading(line);
+    if (!parsed || seenNumbers.has(parsed.number)) {
+      return;
+    }
+
+    if (hasLikelySentenceEnding(parsed.title) || parsed.title.length > 90) {
+      return;
+    }
+
+    seenNumbers.add(parsed.number);
+    ordered.push({ ...parsed, firstIndex: index });
+  });
+
+  const majorByNumber = new Map<string, { number: string; title: string }>();
+  ordered
+    .filter((item) => item.level === "major")
+    .forEach((item) => {
+      majorByNumber.set(item.number, { number: item.number, title: item.title });
+    });
+
+  const subItems = ordered.filter((item) => item.level === "sub");
+  if (subItems.length < 2 || majorByNumber.size === 0) {
+    return null;
+  }
+
+  const tocEndIndex = Math.max(...ordered.map((item) => item.firstIndex)) + 1;
+  const items: NumberedOutlineItem[] = subItems.map((item, index) => {
+    const parentNumber = item.number.split(".")[0].padStart(2, "0");
+    const parent = majorByNumber.get(parentNumber) || { number: parentNumber, title: "" };
+    return {
+      number: item.number,
+      title: item.title,
+      parentNumber: parent.number,
+      parentTitle: parent.title,
+      level: "sub",
+      order: index + 1,
+      bodyText: "",
+    };
+  });
+
+  const bodyStarts = items.map((item) => {
+    const startIndex = lines.findIndex((line, lineIndex) => lineIndex >= tocEndIndex && lineMatchesOutlineItem(line, item));
+    return startIndex >= 0 ? startIndex : item.order - 1;
+  });
+
+  const resolvedItems = items.map((item, index) => {
+    const start = bodyStarts[index] >= 0 ? bodyStarts[index] : 0;
+    const nextStarts = bodyStarts.filter((value) => value > start);
+    const end = nextStarts.length > 0 ? Math.min(...nextStarts) : lines.length;
+    const bodyLines = lines.slice(start, end);
+    const parentHeader = item.parentTitle ? `${item.parentNumber} ${item.parentTitle}` : "";
+    const itemHeader = `${item.number} ${item.title}`;
+    const bodyText = normalizeSourceMaterialText([parentHeader, itemHeader, ...bodyLines].filter(Boolean).join("\n"));
+
+    return {
+      ...item,
+      bodyText: bodyText.slice(0, 12000),
+    };
+  });
+
+  return {
+    majors: Array.from(majorByNumber.values()),
+    items: resolvedItems,
+  };
+}
+
 function countStopwords(text: string, stopwords: string[]) {
   return stopwords.reduce((total, word) => {
     const pattern = new RegExp(`\\b${word}\\b`, "g");
@@ -332,7 +505,7 @@ function normalizeShortClipDurationSec(durationSec: unknown, fallback = 45) {
     return fallback;
   }
 
-  return Math.max(25, Math.min(90, Math.round(parsed)));
+  return Math.max(30, Math.min(120, Math.round(parsed)));
 }
 
 function normalizeSceneEstimatedSec(value: unknown, fallback = 12) {
@@ -408,6 +581,127 @@ function normalizeTtsMetadata(tts: any) {
   };
 }
 
+const SLIDE_TYPES = ["title", "bullets", "definition", "comparison", "stat"] as const;
+
+function normalizeSlide(
+  rawSlide: any,
+  scene: { headline: string; body: string; captionLines: string[]; callouts: string[] }
+): { type: string; data: any } | null {
+  if (!rawSlide || typeof rawSlide !== "object") {
+    return null;
+  }
+  const rawType = String(rawSlide?.type || "").trim().toLowerCase();
+  const type = (SLIDE_TYPES as readonly string[]).includes(rawType) ? rawType : null;
+  if (!type) {
+    return null;
+  }
+  const rawData = rawSlide?.data && typeof rawSlide.data === "object" ? rawSlide.data : {};
+
+  const clampField = (value: any) =>
+    clampText(trimText(value, ""), LENGTH_LIMITS.slideTextField);
+  const clampBullet = (value: any) => clampText(trimText(value, ""), LENGTH_LIMITS.slideBullet);
+  const clampLong = (value: any) => clampText(trimText(value, ""), LENGTH_LIMITS.sceneBody);
+
+  if (type === "title") {
+    const headline = clampText(
+      trimText(rawData.headline, scene.headline),
+      LENGTH_LIMITS.sceneHeadline
+    );
+    if (!headline) return null;
+    return {
+      type,
+      data: {
+        eyebrow: clampField(rawData.eyebrow) || undefined,
+        headline,
+        subhead: clampField(rawData.subhead) || undefined,
+        accent: clampField(rawData.accent) || undefined,
+      },
+    };
+  }
+
+  if (type === "bullets") {
+    const headline = clampText(
+      trimText(rawData.headline, scene.headline),
+      LENGTH_LIMITS.sceneHeadline
+    );
+    const rawItems = Array.isArray(rawData.items) ? rawData.items : [];
+    const items = rawItems
+      .map((item: any) => ({
+        label: clampBullet(item?.label),
+        detail: clampField(item?.detail) || undefined,
+      }))
+      .filter((item: any) => item.label)
+      .slice(0, 5);
+    if (items.length < 2) {
+      const fallbackItems = scene.captionLines
+        .concat(scene.callouts)
+        .filter(Boolean)
+        .slice(0, 5)
+        .map((label) => ({ label: clampBullet(label) }))
+        .filter((item) => item.label);
+      if (items.length === 0 && fallbackItems.length < 2) {
+        return null;
+      }
+      while (items.length < Math.min(2, fallbackItems.length)) {
+        const next = fallbackItems[items.length];
+        if (!next) break;
+        items.push(next);
+      }
+    }
+    return { type, data: { headline, items } };
+  }
+
+  if (type === "definition") {
+    const term = clampField(rawData.term) || clampField(scene.headline);
+    const definition = clampLong(rawData.definition) || clampLong(scene.body);
+    if (!term || !definition) return null;
+    return {
+      type,
+      data: {
+        term,
+        definition,
+        example: clampLong(rawData.example) || undefined,
+      },
+    };
+  }
+
+  if (type === "comparison") {
+    const headline = clampText(
+      trimText(rawData.headline, scene.headline),
+      LENGTH_LIMITS.sceneHeadline
+    );
+    const buildSide = (raw: any) => {
+      if (!raw || typeof raw !== "object") return null;
+      const title = clampField(raw.title);
+      const points = Array.isArray(raw.points)
+        ? raw.points.map(clampBullet).filter(Boolean).slice(0, 4)
+        : [];
+      if (!title || points.length === 0) return null;
+      return { title, points };
+    };
+    const left = buildSide(rawData.left);
+    const right = buildSide(rawData.right);
+    if (!left || !right) return null;
+    return { type, data: { headline, left, right } };
+  }
+
+  if (type === "stat") {
+    const value = clampField(rawData.value);
+    if (!value) return null;
+    return {
+      type,
+      data: {
+        headline: clampText(trimText(rawData.headline, ""), LENGTH_LIMITS.sceneHeadline) || undefined,
+        value,
+        unit: clampBullet(rawData.unit) || undefined,
+        caption: clampLong(rawData.caption) || undefined,
+      },
+    };
+  }
+
+  return null;
+}
+
 function normalizeShortScenes(
   rawScenes: any[],
   ideaId: string,
@@ -418,48 +712,58 @@ function normalizeShortScenes(
   const maxScenes = Math.max(minScenes, Math.round(Number(options.maxScenes || 7)));
   const normalized = Array.isArray(rawScenes)
     ? rawScenes
-        .map((scene: any, index: number) => ({
-          id: trimText(scene?.id, `${ideaId}-scene-${index + 1}`),
-          order: Math.max(1, Math.min(7, Math.round(Number(scene?.order || index + 1)))),
-          headline: clampText(
+        .map((scene: any, index: number) => {
+          const headline = clampText(
             trimText(scene?.headline, `${languageProfile.defaults.shortSceneHeadline} ${index + 1}`),
             LENGTH_LIMITS.sceneHeadline
-          ),
-          body: clampText(trimText(scene?.body, languageProfile.defaults.shortSceneBody), LENGTH_LIMITS.sceneBody),
-          narration: clampText(
-            trimText(scene?.narration, scene?.body || languageProfile.defaults.shortSceneBody),
-            LENGTH_LIMITS.sceneNarration
-          ),
-          callouts: Array.isArray(scene?.callouts)
+          );
+          const body = clampText(
+            trimText(scene?.body, languageProfile.defaults.shortSceneBody),
+            LENGTH_LIMITS.sceneBody
+          );
+          const callouts = Array.isArray(scene?.callouts)
             ? scene.callouts
                 .map((callout: unknown) => clampText(trimText(callout, ""), LENGTH_LIMITS.sceneCallout))
                 .filter(Boolean)
                 .slice(0, 4)
-            : [],
-          captionLines: Array.isArray(scene?.captionLines)
+            : [];
+          const captionLines = Array.isArray(scene?.captionLines)
             ? scene.captionLines
                 .map((line: unknown) => clampText(trimText(line, ""), LENGTH_LIMITS.sceneCaptionLine))
                 .filter(Boolean)
                 .slice(0, 3)
-            : [],
-          emphasisWords: Array.isArray(scene?.emphasisWords)
-            ? scene.emphasisWords
-                .map((word: unknown) => clampText(trimText(word, ""), LENGTH_LIMITS.sceneEmphasisWord))
-                .filter(Boolean)
-                .slice(0, 4)
-            : [],
-          visualStyle: clampText(trimText(scene?.visualStyle, "clean PPT slide"), LENGTH_LIMITS.sceneVisualStyle),
-          layoutHint: clampText(trimText(scene?.layoutHint, "headline-left, diagram-right"), LENGTH_LIMITS.sceneLayoutHint),
-          motionHint: clampText(
-            trimText(scene?.motionHint, languageProfile.defaults.shortSceneMotionHint),
-            LENGTH_LIMITS.sceneMotionHint
-          ),
-          transitionHint: clampText(
-            trimText(scene?.transitionHint, languageProfile.defaults.shortSceneTransitionHint),
-            LENGTH_LIMITS.sceneTransitionHint
-          ),
-          estimatedSec: normalizeSceneEstimatedSec(scene?.estimatedSec),
-        }))
+            : [];
+          return {
+            id: trimText(scene?.id, `${ideaId}-scene-${index + 1}`),
+            order: Math.max(1, Math.min(7, Math.round(Number(scene?.order || index + 1)))),
+            headline,
+            body,
+            narration: clampText(
+              trimText(scene?.narration, scene?.body || languageProfile.defaults.shortSceneBody),
+              LENGTH_LIMITS.sceneNarration
+            ),
+            callouts,
+            captionLines,
+            emphasisWords: Array.isArray(scene?.emphasisWords)
+              ? scene.emphasisWords
+                  .map((word: unknown) => clampText(trimText(word, ""), LENGTH_LIMITS.sceneEmphasisWord))
+                  .filter(Boolean)
+                  .slice(0, 4)
+              : [],
+            visualStyle: clampText(trimText(scene?.visualStyle, "clean PPT slide"), LENGTH_LIMITS.sceneVisualStyle),
+            layoutHint: clampText(trimText(scene?.layoutHint, "headline-left, diagram-right"), LENGTH_LIMITS.sceneLayoutHint),
+            motionHint: clampText(
+              trimText(scene?.motionHint, languageProfile.defaults.shortSceneMotionHint),
+              LENGTH_LIMITS.sceneMotionHint
+            ),
+            transitionHint: clampText(
+              trimText(scene?.transitionHint, languageProfile.defaults.shortSceneTransitionHint),
+              LENGTH_LIMITS.sceneTransitionHint
+            ),
+            estimatedSec: normalizeSceneEstimatedSec(scene?.estimatedSec),
+            slide: normalizeSlide(scene?.slide, { headline, body, captionLines, callouts }),
+          };
+        })
         .filter((scene: any) => scene.headline || scene.body || scene.narration)
         .sort((left: any, right: any) => left.order - right.order)
         .slice(0, maxScenes)
@@ -480,6 +784,7 @@ function normalizeShortScenes(
       motionHint: languageProfile.defaults.shortSceneMotionHint,
       transitionHint: languageProfile.defaults.shortSceneTransitionHint,
       estimatedSec: 12,
+      slide: null,
     },
   ];
 
@@ -499,6 +804,7 @@ function normalizeShortScenes(
       motionHint: languageProfile.defaults.shortSceneMotionHint,
       transitionHint: languageProfile.defaults.shortSceneTransitionHint,
       estimatedSec: 12,
+      slide: null,
     });
   }
 
@@ -608,8 +914,7 @@ function getRawShortClipSources(rawIdea: any) {
 function normalizeShortIdea(rawIdea: any, index: number, languageProfile: LanguageProfile) {
   const baseTitle = clampText(
     trimText(rawIdea?.title, `${languageProfile.defaults.lessonTitle} ${index + 1}`)
-      .replace(/^(?:제?\s*\d+\s*(?:장|절|부|과|편)|chapter\s+\d+|part\s+\d+|section\s+\d+)[.:]?\s*/iu, "")
-      .replace(/^\d+(?:\.\d+)*[\])\.:\-]?\s+/u, ""),
+      .replace(/^(?:제?\s*\d+\s*(?:장|절|부|과|편)|chapter\s+\d+|part\s+\d+|section\s+\d+)[.:]?\s*/iu, ""),
     LENGTH_LIMITS.ideaTitle
   );
   const ideaId = slugify(baseTitle, `idea-${index + 1}`);
@@ -656,9 +961,9 @@ function isShortIdeaValid(rawIdea: any) {
 
       return (
         Boolean(trimText(clip?.title, "")) &&
-        Number.isFinite(clipDurationSec) &&
-        clipDurationSec >= 25 &&
-        clipDurationSec <= 90 &&
+            Number.isFinite(clipDurationSec) &&
+            clipDurationSec >= 30 &&
+            clipDurationSec <= 120 &&
         Boolean(trimText(clip?.hook, "")) &&
         Boolean(trimText(clip?.learningGoal, "")) &&
         Boolean(trimText(clip?.targetPlatform, "")) &&
@@ -879,7 +1184,7 @@ function normalizePackReviewQuestions(rawPackReview: any, ideas: any[], language
 }
 
 function collectPackText(rawPack: any) {
-  const format = rawPack?.format === "shorts" ? "shorts" : "cards";
+  const format = rawPack?.format === "shorts" ? "shorts" : rawPack?.format === "deck" ? "deck" : "cards";
   const parts = [
     rawPack.title,
     rawPack.subtitle,
@@ -891,6 +1196,38 @@ function collectPackText(rawPack: any) {
     rawPack.coverLabel,
     ...(rawPack.coverLines || []),
   ];
+
+  if (format === "deck") {
+    parts.push(rawPack.theme, rawPack.audience);
+    for (const slide of rawPack.slides || []) {
+      parts.push(
+        slide?.section,
+        slide?.title,
+        slide?.thesis,
+        slide?.layout,
+        slide?.visualMetaphor,
+        slide?.imagePrompt,
+        slide?.speakerNotes
+      );
+      for (const block of slide?.textBlocks || []) {
+        parts.push(block?.role, block?.text, block?.emphasis);
+      }
+      const diagram = slide?.diagram || {};
+      for (const node of diagram.nodes || []) {
+        parts.push(node?.label, node?.role);
+      }
+      for (const edge of diagram.edges || []) {
+        parts.push(edge?.label);
+      }
+      for (const step of diagram.steps || []) {
+        parts.push(step?.label, step?.detail);
+      }
+      for (const row of diagram.rows || []) {
+        parts.push(row?.label, row?.left, row?.right);
+      }
+    }
+    return parts.filter(Boolean).join(" ");
+  }
 
   for (const idea of rawPack.ideas || []) {
     if (format === "shorts") {
@@ -972,6 +1309,60 @@ function shouldRetryForLanguageMismatch(languageProfile: LanguageProfile, rawPac
   return false;
 }
 
+function normalizeLessonCardExtras(card: any) {
+  const cardType = pickEnumValue(card?.cardType, CARD_TYPES, "concept");
+  const mediaKind = pickEnumValue(card?.media?.kind, CARD_MEDIA_KINDS, "none");
+  const diagramKind = pickEnumValue(card?.diagram?.kind, CARD_DIAGRAM_KINDS, "none");
+  const interactionKind = pickEnumValue(card?.interaction?.kind, CARD_INTERACTION_KINDS, "none");
+  const rawCheckOptions = Array.isArray(card?.check?.options) ? card.check.options : [];
+  const checkOptions = rawCheckOptions
+    .map((option: unknown) => clampText(trimText(option, ""), LENGTH_LIMITS.practiceOption))
+    .filter(Boolean)
+    .slice(0, 4);
+  const checkCorrectIndex = Math.max(
+    0,
+    Math.min(checkOptions.length - 1, Math.round(Number(card?.check?.correctIndex || 0)))
+  );
+
+  return {
+    cardType,
+    media: {
+      kind: mediaKind,
+      query: clampText(trimText(card?.media?.query, ""), 160),
+      caption: clampText(trimText(card?.media?.caption, ""), 180),
+      imagePrompt: clampText(trimText(card?.media?.imagePrompt, ""), 500),
+    },
+    diagram: {
+      kind: diagramKind,
+      title: clampText(trimText(card?.diagram?.title, ""), 80),
+      labels: Array.isArray(card?.diagram?.labels)
+        ? card.diagram.labels
+            .map((label: unknown) => clampText(trimText(label, ""), 40))
+            .filter(Boolean)
+            .slice(0, 6)
+        : [],
+      expression: clampText(trimText(card?.diagram?.expression, ""), 120),
+    },
+    interaction: {
+      kind: interactionKind,
+      prompt: clampText(trimText(card?.interaction?.prompt, ""), 180),
+      options: Array.isArray(card?.interaction?.options)
+        ? card.interaction.options
+            .map((option: unknown) => clampText(trimText(option, ""), 80))
+            .filter(Boolean)
+            .slice(0, 5)
+        : [],
+      answer: clampText(trimText(card?.interaction?.answer, ""), 120),
+    },
+    check: {
+      question: clampText(trimText(card?.check?.question, ""), LENGTH_LIMITS.practiceQuestion),
+      options: checkOptions,
+      correctIndex: checkOptions.length ? checkCorrectIndex : 0,
+      explanation: clampText(trimText(card?.check?.explanation, ""), LENGTH_LIMITS.practiceExplanation),
+    },
+  };
+}
+
 function normalizeCardsPack(rawPack: any, overrides: any, languageProfile: LanguageProfile) {
   const defaults = languageProfile.defaults;
   const title = normalizeShortTitle(
@@ -1006,6 +1397,7 @@ function normalizeCardsPack(rawPack: any, overrides: any, languageProfile: Langu
       ),
       body: clampText(trimText(card.body, defaults.lessonBody), LENGTH_LIMITS.lessonBody),
       support: clampText(trimText(card.support, defaults.lessonSupport), LENGTH_LIMITS.lessonSupport),
+      ...normalizeLessonCardExtras(card),
     })),
     summaryBullets: (idea.summaryBullets || [])
       .map((bullet: unknown) => clampText(trimText(bullet, ""), LENGTH_LIMITS.summaryBullet))
@@ -1099,15 +1491,235 @@ function normalizeShortsPack(rawPack: any, overrides: any, languageProfile: Lang
   };
 }
 
+const DECK_LAYOUTS = [
+  "hero_blueprint",
+  "concept_map",
+  "process_pipeline",
+  "comparison_matrix",
+  "layered_model",
+  "architecture_blueprint",
+  "three_cards",
+  "data_story",
+] as const;
+
+const DECK_TEXT_ROLES = ["kicker", "headline", "body", "callout", "label", "stat"] as const;
+
+function normalizeDeckTextBlocks(rawBlocks: any[], fallbackTitle: string, fallbackThesis: string) {
+  const blocks = Array.isArray(rawBlocks)
+    ? rawBlocks
+        .map((block: any) => {
+          const role = String(block?.role || "").trim().toLowerCase();
+          return {
+            role: (DECK_TEXT_ROLES as readonly string[]).includes(role) ? role : "body",
+            text: clampText(trimText(block?.text, ""), LENGTH_LIMITS.deckTextBlock),
+            emphasis: clampText(trimText(block?.emphasis, ""), LENGTH_LIMITS.deckDiagramLabel) || undefined,
+          };
+        })
+        .filter((block: any) => block.text)
+        .slice(0, 8)
+    : [];
+
+  if (!blocks.some((block: any) => block.role === "headline")) {
+    blocks.unshift({
+      role: "headline",
+      text: clampText(fallbackTitle, LENGTH_LIMITS.deckTextBlock),
+      emphasis: undefined,
+    });
+  }
+
+  if (blocks.length < 2 && fallbackThesis) {
+    blocks.push({
+      role: "body",
+      text: clampText(fallbackThesis, LENGTH_LIMITS.deckTextBlock),
+      emphasis: undefined,
+    });
+  }
+
+  return blocks.slice(0, 8);
+}
+
+function normalizeDeckDiagram(rawDiagram: any) {
+  const diagram = rawDiagram && typeof rawDiagram === "object" ? rawDiagram : {};
+  const nodes = Array.isArray(diagram.nodes)
+    ? diagram.nodes
+        .map((node: any, index: number) => ({
+          id: clampText(trimText(node?.id, `node-${index + 1}`), 48),
+          label: clampText(trimText(node?.label, ""), LENGTH_LIMITS.deckDiagramLabel),
+          role: clampText(trimText(node?.role, ""), LENGTH_LIMITS.deckDiagramNote),
+        }))
+        .filter((node: any) => node.label)
+        .slice(0, 10)
+    : [];
+  const nodeIds = new Set(nodes.map((node: any) => node.id));
+  const edges = Array.isArray(diagram.edges)
+    ? diagram.edges
+        .map((edge: any) => ({
+          from: clampText(trimText(edge?.from, ""), 48),
+          to: clampText(trimText(edge?.to, ""), 48),
+          label: clampText(trimText(edge?.label, ""), LENGTH_LIMITS.deckDiagramLabel),
+        }))
+        .filter((edge: any) => nodeIds.has(edge.from) && nodeIds.has(edge.to))
+        .slice(0, 12)
+    : [];
+  const steps = Array.isArray(diagram.steps)
+    ? diagram.steps
+        .map((step: any) => ({
+          label: clampText(trimText(step?.label, ""), LENGTH_LIMITS.deckDiagramLabel),
+          detail: clampText(trimText(step?.detail, ""), LENGTH_LIMITS.deckDiagramNote),
+        }))
+        .filter((step: any) => step.label || step.detail)
+        .slice(0, 7)
+    : [];
+  const rows = Array.isArray(diagram.rows)
+    ? diagram.rows
+        .map((row: any) => ({
+          label: clampText(trimText(row?.label, ""), LENGTH_LIMITS.deckDiagramLabel),
+          left: clampText(trimText(row?.left, ""), LENGTH_LIMITS.deckDiagramNote),
+          right: clampText(trimText(row?.right, ""), LENGTH_LIMITS.deckDiagramNote),
+        }))
+        .filter((row: any) => row.label && (row.left || row.right))
+        .slice(0, 6)
+    : [];
+
+  return { nodes, edges, steps, rows };
+}
+
+function normalizeDeckSlide(rawSlide: any, index: number, languageProfile: LanguageProfile) {
+  const rawLayout = String(rawSlide?.layout || "").trim().toLowerCase();
+  const layout = (DECK_LAYOUTS as readonly string[]).includes(rawLayout)
+    ? rawLayout
+    : (DECK_LAYOUTS[index % DECK_LAYOUTS.length] as string);
+  const title = clampText(
+    trimText(rawSlide?.title, `${languageProfile.defaults.lessonTitle} ${index + 1}`),
+    LENGTH_LIMITS.deckSlideTitle
+  );
+  const thesis = clampText(
+    trimText(rawSlide?.thesis, rawSlide?.speakerNotes || title),
+    LENGTH_LIMITS.deckSlideThesis
+  );
+  const diagram = normalizeDeckDiagram(rawSlide?.diagram);
+  const textBlocks = normalizeDeckTextBlocks(rawSlide?.textBlocks, title, thesis);
+
+  return {
+    id: trimText(rawSlide?.id, `slide-${index + 1}`),
+    order: Math.max(1, Math.min(18, Math.round(Number(rawSlide?.order || index + 1)))),
+    section: clampText(trimText(rawSlide?.section, ""), 80),
+    title,
+    thesis,
+    layout,
+    visualMetaphor: clampText(
+      trimText(rawSlide?.visualMetaphor, thesis),
+      LENGTH_LIMITS.deckVisualMetaphor
+    ),
+    textBlocks,
+    diagram,
+    imagePrompt: clampText(trimText(rawSlide?.imagePrompt, ""), LENGTH_LIMITS.deckImagePrompt),
+    speakerNotes: clampText(trimText(rawSlide?.speakerNotes, thesis), LENGTH_LIMITS.deckSpeakerNotes),
+  };
+}
+
+function normalizeDeckPack(rawPack: any, overrides: any, languageProfile: LanguageProfile) {
+  const defaults = languageProfile.defaults;
+  const title = normalizeShortTitle(
+    trimText(rawPack.title, overrides.title || defaults.title),
+    overrides.title || defaults.title,
+    LENGTH_LIMITS.packTitle,
+    8
+  );
+  const rawSlides = Array.isArray(rawPack?.slides) ? rawPack.slides : [];
+  const slides = rawSlides
+    .map((slide: any, index: number) => normalizeDeckSlide(slide, index, languageProfile))
+    .filter((slide: any) => slide.title || slide.thesis)
+    .sort((left: any, right: any) => left.order - right.order)
+    .slice(0, 18)
+    .map((slide: any, index: number) => ({ ...slide, order: index + 1 }));
+
+  if (slides.length === 0) {
+    slides.push(
+      normalizeDeckSlide(
+        {
+          order: 1,
+          section: defaults.coverLabel,
+          title,
+          thesis: trimText(rawPack.description, defaults.description),
+          layout: "hero_blueprint",
+          visualMetaphor: "A clean educational blueprint that turns source knowledge into a visual map.",
+          textBlocks: [
+            { role: "headline", text: title },
+            { role: "body", text: trimText(rawPack.description, defaults.description) },
+          ],
+          diagram: { nodes: [], edges: [], steps: [], rows: [] },
+          imagePrompt: "",
+          speakerNotes: trimText(rawPack.description, defaults.description),
+        },
+        0,
+        languageProfile
+      )
+    );
+  }
+
+  const packId = slugify(title, `deck-${Date.now()}`);
+  const accent =
+    accentPalette[
+      title.split("").reduce((sum, character) => sum + character.charCodeAt(0), 0) %
+        accentPalette.length
+    ];
+  const normalizedLanguage = languageProfile.code === "unknown" ? detectSourceLanguage(collectPackText({ ...rawPack, format: "deck", slides })).code : languageProfile.code;
+
+  return {
+    id: packId,
+    format: "deck",
+    status: "ready",
+    title,
+    subtitle: clampText(trimText(rawPack.subtitle, defaults.subtitle), LENGTH_LIMITS.subtitle),
+    author: clampText(trimText(rawPack.author, overrides.author || defaults.author), LENGTH_LIMITS.author),
+    category: clampText(trimText(rawPack.category, overrides.category || defaults.category), LENGTH_LIMITS.category),
+    description: clampText(trimText(rawPack.description, defaults.description), LENGTH_LIMITS.description),
+    theme: clampText(trimText(rawPack.theme, "blueprint"), LENGTH_LIMITS.deckTheme),
+    audience: clampText(trimText(rawPack.audience, "self-study learners"), LENGTH_LIMITS.deckAudience),
+    heroLine: clampText(trimText(rawPack.heroLine, defaults.heroLine), LENGTH_LIMITS.heroLine),
+    keyIdeaCount: slides.length,
+    minutesPerIdea: clampText(trimText(rawPack.minutesPerIdea, "visual slide deck"), LENGTH_LIMITS.minutesPerIdea),
+    accent,
+    icon: "dashboard",
+    coverLabel: clampText(trimText(rawPack.coverLabel, "DECK"), LENGTH_LIMITS.coverLabel),
+    coverLines: normalizeCoverLines(rawPack.coverLines, title, languageProfile),
+    generationSteps: languageProfile.generationSteps,
+    languageCode: normalizedLanguage,
+    packReview: null,
+    slides,
+    ideas: slides.map((slide: any, index: number) => ({
+      id: slide.id || `slide-${index + 1}`,
+      section: slide.section,
+      title: slide.title,
+      teaser: slide.thesis,
+      duration: "1 slide",
+      icon: iconPalette[index % iconPalette.length],
+      deckSlideId: slide.id || `slide-${index + 1}`,
+      lessonCards: [],
+      summaryBullets: slide.textBlocks.map((block: any) => block.text).filter(Boolean).slice(0, 4),
+      reflectionPrompt: slide.thesis,
+      practice: { questions: [] },
+    })),
+  };
+}
+
 export function normalizePack(
   rawPack: any,
   overrides: any,
   languageProfile: LanguageProfile,
-  requestedFormat: PackFormat = rawPack?.format === "shorts" ? "shorts" : "cards"
+  requestedFormat: PackFormat =
+    rawPack?.format === "shorts" ? "shorts" : rawPack?.format === "deck" ? "deck" : "cards"
 ) {
-  return requestedFormat === "shorts"
-    ? normalizeShortsPack(rawPack, overrides, languageProfile)
-    : normalizeCardsPack(rawPack, overrides, languageProfile);
+  if (requestedFormat === "shorts") {
+    return normalizeShortsPack(rawPack, overrides, languageProfile);
+  }
+
+  if (requestedFormat === "deck") {
+    return normalizeDeckPack(rawPack, overrides, languageProfile);
+  }
+
+  return normalizeCardsPack(rawPack, overrides, languageProfile);
 }
 
 function isChapterLevelHeading(text: string) {
@@ -1119,7 +1731,8 @@ function isChapterLevelHeading(text: string) {
   );
 }
 
-export function splitSourceIntoChunks(sourceText: string) {
+export function splitSourceIntoChunks(sourceText: string, modelId?: string) {
+  const chunkLimit = modelId ? getChunkSizeForModel(modelId) : CHUNK_CHAR_THRESHOLD;
   const normalized = normalizeSourceMaterialText(sourceText);
   const lines = normalized.split("\n");
   const sectionStarts = [0];
@@ -1132,9 +1745,12 @@ export function splitSourceIntoChunks(sourceText: string) {
   }
 
   const hasMultipleChapters = sectionStarts.length >= 4;
-  if (normalized.length <= CHUNK_CHAR_THRESHOLD && !hasMultipleChapters) {
+  if (normalized.length <= chunkLimit && !hasMultipleChapters) {
     return [normalized];
   }
+  const effectiveChunkLimit = hasMultipleChapters
+    ? Math.min(chunkLimit, Math.max(1, Math.ceil(normalized.length / 2)))
+    : chunkLimit;
 
   const chunks: string[] = [];
   let currentLines: string[] = [];
@@ -1146,7 +1762,7 @@ export function splitSourceIntoChunks(sourceText: string) {
     const sectionLines = lines.slice(start, end);
     const sectionLength = sectionLines.reduce((sum, line) => sum + line.length + 1, 0);
 
-    if (currentLength > 0 && currentLength + sectionLength > CHUNK_TARGET_SIZE) {
+    if (currentLength > 0 && currentLength + sectionLength > effectiveChunkLimit) {
       chunks.push(currentLines.join("\n"));
       currentLines = [];
       currentLength = 0;
@@ -1160,15 +1776,15 @@ export function splitSourceIntoChunks(sourceText: string) {
     chunks.push(currentLines.join("\n"));
   }
 
-  if (chunks.length <= 1 && normalized.length > CHUNK_CHAR_THRESHOLD) {
+  if (chunks.length <= 1 && normalized.length > effectiveChunkLimit) {
     const fallbackChunks: string[] = [];
     let cursor = 0;
 
     while (cursor < normalized.length) {
-      let end = Math.min(cursor + CHUNK_TARGET_SIZE, normalized.length);
+      let end = Math.min(cursor + effectiveChunkLimit, normalized.length);
       if (end < normalized.length) {
         const paragraphBreak = normalized.lastIndexOf("\n\n", end);
-        if (paragraphBreak > cursor + CHUNK_TARGET_SIZE * 0.5) {
+        if (paragraphBreak > cursor + effectiveChunkLimit * 0.5) {
           end = paragraphBreak;
         }
       }
@@ -1231,6 +1847,12 @@ export function buildChunkPrompt({
     "- Idea titles should stay close to the original source headings. Keep them concise but recognizable - up to about 8 words.",
     "- Each idea MUST have at least 5 lesson cards. If the source material for an idea is rich or detailed, use 8-18 or more.",
     "- One card = one concept, one step, or one point. If a card covers two distinct points, split it into two cards.",
+    "- Each card must choose the most efficient learning mode with `cardType`: concept, comparison, diagram, interactive, recall, quiz, source_image, or free_image.",
+    "- Use concept for intuition/explanation, comparison for two-sided distinctions, diagram for formulas/graphs/matrices/flows/layers, interactive for a learner action, recall for memory retrieval, quiz for an embedded check, source_image when an original document figure would be best, and free_image when a real-world copyright-free image would help.",
+    "- For source_image/free_image cards, fill `media.kind`, `media.query`, and `media.caption`. Do not invent a file path or URL.",
+    "- For diagram cards, fill `diagram.kind`, `diagram.title`, `diagram.labels`, and `diagram.expression` when useful. Prefer directly rendered diagrams over AI images for exact math, graphs, tables, matrices, and model structures.",
+    "- For interactive cards, fill `interaction.kind`, `interaction.prompt`, `interaction.options`, and `interaction.answer`. Use only simple interactions: flip, toggle, slider, order, or fill_blank.",
+    "- For quiz cards, fill `check.question`, `check.options`, `check.correctIndex`, and `check.explanation`.",
     "- Card body: 4 to 8 sentences per card.",
     "- Card body should open with plain-language intuition, then build up to the formal concept.",
     "- FORMATTING: Use limited markdown in body and support fields:",
@@ -1316,11 +1938,12 @@ export function buildShortIdeaOutlinePrompt({
     "This is not a summary. Create idea boundaries that can each become a small sequence of concept-led short clips.",
     languageInstruction,
     "Requirements:",
-    "- Create as many ideas as needed to cover every distinct section, concept group, or worked method in this chunk.",
+    "- Preserve the source's own chapter/section order whenever it exists. Do not reorder the lesson for creativity.",
+    "- Create one idea per meaningful source subsection, not one idea per tiny concept. Avoid over-producing many tiny videos.",
     "- Idea titles must stay close to the source headings, but remove chapter numbering.",
     "- Each idea MUST have a `section`, `title`, `teaser`, and `durationSec`.",
-    "- `durationSec` is the estimated total runtime for that idea across all of its clips.",
-    "- `durationSec` must be an integer between 45 and 300.",
+    "- `durationSec` is the estimated runtime for the subsection's finished short.",
+    "- Aim for 30-60 seconds, preferably 40-55 seconds. If the subsection is complex, it may be longer; do not make it short just to satisfy a rigid number.",
     "- If explicit headings exist in the chunk, create at least one idea per heading.",
     ...(sectionHeadingHints.length > 0
       ? [
@@ -1338,11 +1961,13 @@ export function buildShortIdeaStoryboardPrompt({
   outline,
   chunkText,
   languageProfile,
+  previousIdeaSummaries,
   retryReason,
 }: {
   outline: any;
   chunkText: string;
   languageProfile: LanguageProfile;
+  previousIdeaSummaries?: string[];
   retryReason?: string;
 }) {
   const languageInstruction =
@@ -1358,14 +1983,12 @@ export function buildShortIdeaStoryboardPrompt({
     retryReason ? `Correction from the previous attempt: ${retryReason}` : null,
     "Requirements:",
     "- Keep the idea focused on the requested outline only. Do not bleed in unrelated material from the same chunk.",
-    "- Do NOT turn the whole idea into one long short.",
-    "- Split the idea into concept-based `clips`, like cards in the card format. Each clip should teach one clean concept, distinction, worked step, or example.",
-    "- Use concept boundaries, not arbitrary time slicing.",
-    "- Create 1-5 clips depending on the idea. Usually 2-4 clips is best unless the idea is truly atomic.",
-    "- The overall idea should usually land around 45-300 seconds total across all clips.",
-    "- Each clip should usually land around 25-90 seconds. Do not force clips under 30 seconds if the concept needs more space.",
+    "- Create EXACTLY ONE `clip` for this outline in normal cases. Do not split one subsection into many tiny shorts.",
+    "- That one clip should feel like a complete vertical short for this subsection.",
+    "- Runtime guidance: aim for 30-60 seconds, preferably 40-55 seconds. If the concept genuinely needs more time, it may be longer. Never make a throwaway short under 30 seconds.",
     "- The `clips` array items must include: title, teaser, durationSec, hook, learningGoal, targetPlatform, videoStyle, captionStyle, musicCue, coverSceneId, narrationScript, scenes.",
     "- Every clip should feel self-contained, but the sequence of clips should still build naturally across the idea.",
+    "- Use 4-7 scenes inside the clip. Scenes are visual beats within ONE short, not separate shorts.",
     "- Every scene must include: headline, body, narration, callouts, captionLines, emphasisWords, visualStyle, layoutHint, motionHint, transitionHint, estimatedSec.",
     "- Scene body is on-screen copy for a PPT-like slide. Keep it concise and readable on mobile.",
     "- `captionLines` are the punchy on-screen caption overlay. Use 1-2 short lines per scene.",
@@ -1375,14 +1998,26 @@ export function buildShortIdeaStoryboardPrompt({
     "- `transitionHint` should describe how the scene should connect into the next beat.",
     "- `coverSceneId` should identify the most visually gripping scene within that clip. Use a simple order-based id like `scene-1`, `scene-2`, or `scene-3`.",
     "- Each clip's `narrationScript` must read like a complete mini-lesson and align with that clip's scene narrations.",
+    "- IMPORTANT: Clips must ONLY contain teaching content (concepts, examples, distinctions, demonstrations). Never create a clip that previews, introduces, or wraps up a quiz. The quiz is a separate interactive feature that the learner triggers after finishing the clips; do not narrate `Now let's take a quiz`, `Here comes the practice`, `Test yourself next`, or any similar meta-content as a clip.",
+    "- IMPORTANT: Do not repeat explanations from previous shorts. If an earlier short already introduced a concept, refer to it briefly only when needed and move the learner forward.",
     "- `quiz.questions` must contain exactly 3 questions with exactly 3 options each.",
-    "- Prefer plain-language explanation first, then the formal concept.",
+    "- IMPORTANT: Every quiz question MUST be answerable using ONLY the content actually narrated inside this idea's `clips[].scenes[].narration` and `narrationScript`. Do not ask about facts, formulas, names, dates, or details that were not explicitly stated in the clips of THIS idea, even if those facts appear in the source chunk. If a question would require knowledge outside the narrated clips, replace it with one that the clips actually teach.",
+    "- 'Easy enough for middle school students' means intuitive and concrete, not childish. Use clear analogies, then connect them to the formal concept.",
+    "- Do not read the source aloud. Transform it into a high-impact learning explanation that keeps the source's intent and order.",
     "- Do not omit formulas, definitions, or critical distinctions that belong to this idea.",
+    "",
+    "SCREEN COPY RULES:",
+    "- Do not include a `slide` object. The app will render each scene from headline, body, captionLines, callouts, and generated media.",
+    "- Keep headline/body/captionLines concise enough for a 9:16 mobile screen.",
+    "- Vary scene information shapes naturally using the available fields: definition-like scenes, comparisons, examples, steps, and punchy facts.",
     "",
     `Requested idea section: ${outline?.section || ""}`,
     `Requested idea title: ${outline?.title || ""}`,
     `Requested idea teaser: ${outline?.teaser || ""}`,
     `Target durationSec: ${normalizeIdeaDurationSec(outline?.durationSec)}`,
+    Array.isArray(previousIdeaSummaries) && previousIdeaSummaries.length > 0
+      ? ["Previous shorts already covered these points; avoid repeating them verbatim:", ...previousIdeaSummaries.slice(-6).map((summary) => `- ${summary}`)].join("\n")
+      : null,
     "",
     "Relevant source chunk:",
     chunkText,
@@ -1429,6 +2064,88 @@ export function buildShortMetaPrompt({
     "- Do not include packReview.",
     "",
     ...requestedHints,
+  ].join("\n");
+}
+
+export function buildDeckPrompt({
+  title,
+  author,
+  category,
+  sourceText,
+  languageProfile,
+  sectionHeadingHints,
+  isMultimodal,
+  chunkIndex,
+  totalChunks,
+}: {
+  title?: string;
+  author?: string;
+  category?: string;
+  sourceText: string;
+  languageProfile: LanguageProfile;
+  sectionHeadingHints: string[];
+  isMultimodal?: boolean;
+  chunkIndex?: number;
+  totalChunks?: number;
+}) {
+  const languageInstruction =
+    languageProfile.code === "unknown"
+      ? "Detect the dominant language of the source material and write every user-facing field in that same language."
+      : `Write every user-facing field in ${languageProfile.name} (${languageProfile.code}).`;
+  const requestedHints = [
+    title ? `Requested title hint: ${title}` : null,
+    author ? `Requested author hint: ${author}` : null,
+    category ? `Requested category hint: ${category}` : null,
+  ].filter(Boolean);
+  const sourceReference = isMultimodal
+    ? "The source material is the attached file. Read the full document and ground the deck in that source."
+    : sourceText;
+  const isChunkedDeck = typeof chunkIndex === "number" && Number(totalChunks || 0) > 1;
+
+  return [
+    isChunkedDeck
+      ? `Create polished visual slides for source chunk ${chunkIndex! + 1} of ${totalChunks} as structured JSON.`
+      : "Create a polished visual slide deck from the source material as structured JSON.",
+    "Return valid JSON only. Do not include markdown fences or prose outside JSON.",
+    "This is NOT a bullet summary. Act like a visual storytelling director and information architect.",
+    "Your job is to choose the right visual structure for each concept: blueprint, concept map, process pipeline, comparison matrix, layered model, architecture diagram, card grid, or data story.",
+    languageInstruction,
+    "Deck style:",
+    "- Use a clean educational blueprint style: cream paper, navy technical line art, restrained accent colors, crisp labels, diagrammatic composition.",
+    "- Every slide must have a strong thesis title and a distinct visual idea. Avoid repeated bullet-only slides.",
+    "- Prefer diagrams, flows, tables, architectural metaphors, and structured comparisons over paragraphs.",
+    "- The deck should feel custom to the source, not like fixed templates with text inserted.",
+    "- Use compact text. Exact readable text will be rendered by the app/HTML layer, not by the image model.",
+    "- `imagePrompt` is ONLY for non-text visual assets/backgrounds. It must explicitly avoid readable text, logos, watermarks, and fake labels.",
+    "- `textBlocks`, `diagram.nodes`, `diagram.steps`, and `diagram.rows` contain the exact text that will be rendered by code.",
+    "- For each slide, make `layout` match the information shape, not visual decoration.",
+    isChunkedDeck
+      ? "- For this chunk, include 3-6 slides. Cover this chunk well without repeating setup slides from other chunks."
+      : "- Include 6-12 slides for ordinary material. Use up to 18 only if the source has many distinct sections.",
+    "- Preserve the source's order and do not invent unsupported claims.",
+    "- If the source has formulas or technical distinctions, represent them in diagram rows, node labels, or concise text blocks.",
+    "",
+    "Required layout meanings:",
+    "- hero_blueprint: opening/title slide with one large visual metaphor.",
+    "- concept_map: central concept with related nodes and labeled links.",
+    "- process_pipeline: ordered transformation, workflow, or cause-effect chain.",
+    "- comparison_matrix: two-column contrast or table.",
+    "- layered_model: nested levels, hierarchy, or stack.",
+    "- architecture_blueprint: system/components with directional relations.",
+    "- three_cards: three learner types, categories, examples, or options.",
+    "- data_story: one strong number, equation, chart-like insight, or evidence slide.",
+    "",
+    ...(sectionHeadingHints.length > 0
+      ? [
+          "Source section hints to preserve when useful:",
+          ...sectionHeadingHints.map((hint) => `- ${hint}`),
+          "",
+        ]
+      : []),
+    ...requestedHints,
+    "",
+    "Source material:",
+    sourceReference,
   ].join("\n");
 }
 
@@ -1526,6 +2243,12 @@ export function buildPrompt({
     "- If an idea is dense, use 8-18 or more lesson cards rather than compressing multiple concepts into one card.",
     "- More cards that each teach one small point clearly is ALWAYS better than fewer cards that compress multiple points.",
     "- One card = one concept, one step, or one point. If a card covers two distinct points, split it into two cards.",
+    "- Each card must choose the most efficient learning mode with `cardType`: concept, comparison, diagram, interactive, recall, quiz, source_image, or free_image.",
+    "- Use concept for intuition/explanation, comparison for two-sided distinctions, diagram for formulas/graphs/matrices/flows/layers, interactive for a learner action, recall for memory retrieval, quiz for an embedded check, source_image when an original document figure would be best, and free_image when a real-world copyright-free image would help.",
+    "- For source_image/free_image cards, fill `media.kind`, `media.query`, and `media.caption`. Do not invent a file path or URL.",
+    "- For diagram cards, fill `diagram.kind`, `diagram.title`, `diagram.labels`, and `diagram.expression` when useful. Prefer directly rendered diagrams over AI images for exact math, graphs, tables, matrices, and model structures.",
+    "- For interactive cards, fill `interaction.kind`, `interaction.prompt`, `interaction.options`, and `interaction.answer`. Use only simple interactions: flip, toggle, slider, order, or fill_blank.",
+    "- For quiz cards, fill `check.question`, `check.options`, `check.correctIndex`, and `check.explanation`.",
     "- Card title: short phrase, at most 5 words.",
     "- Card body: 4 to 8 sentences per card.",
     "- Card support: 1 to 4 short sentences with a helpful example, analogy, implication, contrast, common mistake, or mini-case.",
@@ -1594,15 +2317,51 @@ async function generateShortsPackFromSource({
   const isMultimodal = Boolean(geminiFileBuffer);
   const languageProfile = isMultimodal ? UNKNOWN_LANGUAGE_PROFILE : detectSourceLanguage(sourceText);
   const sectionHeadingHints = isMultimodal ? [] : extractSectionHeadingHints(sourceText, languageProfile);
-  const chunks = isMultimodal ? [sourceText] : splitSourceIntoChunks(sourceText);
-  const debug = buildDebugPayload({ sourceText, sectionHeadingHints, chunks, isMultimodal });
+  const numberedOutline = isMultimodal ? null : extractNumberedDocumentOutline(sourceText);
+  const chunks = isMultimodal ? [sourceText] : splitSourceIntoChunks(sourceText, (generateLLM as any).__modelId);
+  const debug = {
+    ...buildDebugPayload({ sourceText, sectionHeadingHints, chunks, isMultimodal }),
+    numberedOutline: numberedOutline
+      ? numberedOutline.items.map((item) => ({
+          number: item.number,
+          title: item.title,
+          parentNumber: item.parentNumber,
+          parentTitle: item.parentTitle,
+          bodyLength: item.bodyText.length,
+        }))
+      : [],
+  };
 
   await onProgress?.({ debug });
-  await onProgress?.({ step: "outlining", totalChunks: chunks.length, completedChunks: 0 });
+  await onProgress?.({
+    step: "extracting toc",
+    totalChunks: 1,
+    completedChunks: numberedOutline ? 1 : 0,
+  });
+  await onProgress?.({ step: "outlining", totalChunks: numberedOutline ? numberedOutline.items.length : chunks.length, completedChunks: 0 });
 
   const outlineRecords: Array<any & { __chunkText: string }> = [];
 
-  for (let index = 0; index < chunks.length; index += 1) {
+  if (numberedOutline?.items?.length) {
+    numberedOutline.items.forEach((item) => {
+      outlineRecords.push({
+        section: item.parentTitle ? `${item.parentNumber} ${item.parentTitle}` : item.parentNumber,
+        title: `${item.number} ${item.title}`,
+        teaser: `${item.title}의 핵심을 짧고 직관적으로 이해합니다.`,
+        durationSec: item.bodyText.length > 5500 ? 75 : 50,
+        __chunkText: [
+          "Use this exact source outline item. Preserve its number, title, parent chapter, and order.",
+          `Parent chapter: ${item.parentNumber} ${item.parentTitle}`,
+          `Subsection: ${item.number} ${item.title}`,
+          "",
+          "Source excerpt for this subsection:",
+          item.bodyText,
+        ].join("\n"),
+      });
+    });
+    await onProgress?.({ completedChunks: outlineRecords.length });
+  } else {
+    for (let index = 0; index < chunks.length; index += 1) {
     const result = await generateLLM({
       max_output_tokens: 16384,
       input: buildShortIdeaOutlinePrompt({
@@ -1630,6 +2389,7 @@ async function generateShortsPackFromSource({
     }
     await onProgress?.({ completedChunks: index + 1 });
   }
+  }
 
   if (outlineRecords.length === 0) {
     throw new Error("No short lecture ideas were generated from the source.");
@@ -1638,6 +2398,7 @@ async function generateShortsPackFromSource({
   await onProgress?.({ step: "storyboarding", totalChunks: outlineRecords.length, completedChunks: 0 });
 
   const rawIdeas: any[] = [];
+  const previousIdeaSummaries: string[] = [];
 
   for (let index = 0; index < outlineRecords.length; index += 1) {
     const outline = outlineRecords[index];
@@ -1647,6 +2408,7 @@ async function generateShortsPackFromSource({
         outline,
         chunkText: outline.__chunkText,
         languageProfile,
+        previousIdeaSummaries,
       }),
       jsonSchema: { name: "short_idea_storyboard", schema: shortIdeaStoryboardSchema },
     });
@@ -1664,8 +2426,9 @@ async function generateShortsPackFromSource({
           outline,
           chunkText: outline.__chunkText,
           languageProfile,
+          previousIdeaSummaries,
           retryReason:
-            "The previous response was incomplete. Make sure the idea is split into concept-based clips, each clip has a valid duration and scenes, and the quiz has exactly 3 questions.",
+            "The previous response was incomplete. Make sure it creates one complete clip for this subsection, has a valid duration and scenes, and the quiz has exactly 3 questions.",
         }),
         jsonSchema: { name: "short_idea_storyboard", schema: shortIdeaStoryboardSchema },
       });
@@ -1679,13 +2442,22 @@ async function generateShortsPackFromSource({
     }
 
     rawIdeas.push({
-      section: rawIdea?.section || outline.section,
-      title: rawIdea?.title || outline.title,
+      section: outline.section || rawIdea?.section,
+      title: outline.title || rawIdea?.title,
       teaser: rawIdea?.teaser || outline.teaser,
       durationSec: rawIdea?.durationSec || outline.durationSec,
-      clips: getRawShortClipSources(rawIdea),
+      clips: getRawShortClipSources(rawIdea).slice(0, 1),
       quiz: rawIdea?.quiz || { questions: [] },
     });
+    previousIdeaSummaries.push(
+      [
+        rawIdea?.title || outline.title,
+        rawIdea?.teaser || outline.teaser,
+        (getRawShortClipSources(rawIdea)[0]?.narrationScript || "").slice(0, 220),
+      ]
+        .filter(Boolean)
+        .join(" - ")
+    );
     await onProgress?.({ completedChunks: index + 1 });
   }
 
@@ -1722,6 +2494,300 @@ async function generateShortsPackFromSource({
   };
 }
 
+async function generateDeckPackFromSource({
+  title,
+  author,
+  category,
+  sourceText,
+  geminiFileBuffer,
+  geminiFileMimeType,
+  generateLLM,
+  onProgress,
+}: {
+  title?: string;
+  author?: string;
+  category?: string;
+  sourceText: string;
+  geminiFileBuffer?: unknown;
+  geminiFileMimeType?: string | null;
+  generateLLM: GenerateLLM;
+  onProgress?: (patch: ProgressPatch) => void | Promise<void>;
+}) {
+  const isMultimodal = Boolean(geminiFileBuffer);
+  const languageProfile = isMultimodal ? UNKNOWN_LANGUAGE_PROFILE : detectSourceLanguage(sourceText);
+  const sectionHeadingHints = isMultimodal ? [] : extractSectionHeadingHints(sourceText, languageProfile);
+  const chunks = isMultimodal ? [sourceText] : splitSourceIntoChunks(sourceText, (generateLLM as any).__modelId);
+  const debug = buildDebugPayload({ sourceText, sectionHeadingHints, chunks, isMultimodal });
+
+  await onProgress?.({ debug });
+
+  let parsed: any;
+
+  if (chunks.length <= 1) {
+    await onProgress?.({ step: "designing deck", totalChunks: 1, completedChunks: 0 });
+
+    const generation = await generateLLM({
+      max_output_tokens: 32768,
+      input: buildDeckPrompt({
+        title,
+        author,
+        category,
+        sourceText: isMultimodal
+          ? "The source material is the attached file. Read every page and generate the deck from it."
+          : sourceText,
+        languageProfile,
+        sectionHeadingHints,
+        isMultimodal,
+      }),
+      jsonSchema: { name: "deck_pack", schema: deckPackSchema },
+      fileBuffer: geminiFileBuffer,
+      fileMimeType: geminiFileMimeType,
+    });
+
+    if (!generation.output_text) {
+      throw new Error("LLM did not return structured text output for a deck.");
+    }
+
+    parsed = JSON.parse(generation.output_text);
+    await onProgress?.({ completedChunks: 1, step: "finalizing" });
+  } else {
+    await onProgress?.({ step: "designing deck", totalChunks: chunks.length, completedChunks: 0 });
+
+    const deckParts: any[] = [];
+    const slides: any[] = [];
+
+    for (let index = 0; index < chunks.length; index += 1) {
+      const generation = await generateLLM({
+        max_output_tokens: 24576,
+        input: buildDeckPrompt({
+          title,
+          author,
+          category,
+          sourceText: chunks[index],
+          languageProfile,
+          sectionHeadingHints,
+          chunkIndex: index,
+          totalChunks: chunks.length,
+        }),
+        jsonSchema: { name: "deck_pack", schema: deckPackSchema },
+      });
+
+      if (!generation.output_text) {
+        throw new Error(`LLM did not return structured text output for deck chunk ${index + 1}.`);
+      }
+
+      const chunkDeck = JSON.parse(generation.output_text);
+      deckParts.push(chunkDeck);
+      const chunkSlides = Array.isArray(chunkDeck?.slides) ? chunkDeck.slides : [];
+      for (const slide of chunkSlides) {
+        slides.push({
+          ...slide,
+          id: trimText(slide?.id, `slide-${slides.length + 1}`),
+          order: slides.length + 1,
+          section: trimText(slide?.section, chunkDeck?.category || `Part ${index + 1}`),
+        });
+      }
+      await onProgress?.({ completedChunks: index + 1 });
+    }
+
+    const firstDeck = deckParts[0] || {};
+    parsed = {
+      ...firstDeck,
+      format: "deck",
+      title: trimText(firstDeck?.title, title || "Learning deck"),
+      author: trimText(firstDeck?.author, author || ""),
+      category: trimText(firstDeck?.category, category || ""),
+      slides,
+    };
+    await onProgress?.({ step: "finalizing" });
+  }
+
+  const pack = normalizePack(
+    { ...parsed, format: "deck" },
+    { title, author, category },
+    languageProfile,
+    "deck"
+  );
+
+  return {
+    debug,
+    languageProfile,
+    pack,
+    sectionHeadingHints,
+  };
+}
+
+// ── 웹 로직 기반 숏츠 brain ──
+// /api/generate-scenes 프롬프트로 씬을 만들고(원문 목차 → 대단원/소단원, 소단원당 씬 1개),
+// 모바일 정규화 팩 형식(idea→clip→scene)으로 매핑한다. 미디어(오디오/이미지)는 이후 enrichShortsPackWithAudio가 채운다.
+async function generateShortsPackFromScenes({
+  title,
+  author,
+  category,
+  sourceText,
+  geminiFileBuffer,
+  geminiFileMimeType,
+  generateLLM,
+  onProgress,
+}: {
+  title?: string;
+  author?: string;
+  category?: string;
+  sourceText: string;
+  geminiFileBuffer?: unknown;
+  geminiFileMimeType?: string | null;
+  generateLLM: GenerateLLM;
+  onProgress?: (patch: ProgressPatch) => void | Promise<void>;
+}) {
+  const isMultimodal = Boolean(geminiFileBuffer);
+  const languageProfile = isMultimodal ? UNKNOWN_LANGUAGE_PROFILE : detectSourceLanguage(sourceText);
+
+  await onProgress?.({ step: "extracting toc", totalChunks: 1, completedChunks: 0 });
+
+  // 1) 씬 생성 (웹 프롬프트/스키마)
+  const scenesInput = isMultimodal
+    ? `${SCENES_SYSTEM_PROMPT}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nStudy material: the entire attached document. Read every page and section carefully, and reproduce its real table of contents.`
+    : buildScenesInput(sourceText);
+  const scenesGen: any = await generateLLM({
+    input: scenesInput,
+    max_output_tokens: 32000,
+    jsonSchema: SCENES_JSON_SCHEMA,
+    ...(isMultimodal ? { fileBuffer: geminiFileBuffer, fileMimeType: geminiFileMimeType } : {}),
+  } as any);
+  const scenes: any[] = (() => {
+    const parsed = normalizeGeneratedScenesPayload(parseScenesJson(scenesGen.output_text));
+    return Array.isArray(parsed?.scenes) ? parsed.scenes : [];
+  })();
+  if (!scenes.length) throw new Error("Scene generation returned no scenes.");
+  scenes.forEach((s) => {
+    s.slides = recomputeSlideStartRatios(s);
+  });
+
+  await onProgress?.({ step: "storyboarding", totalChunks: 1, completedChunks: 1 });
+
+  // 2) 장면당 4지선다 퀴즈
+  let quizQuestions: any[] = [];
+  try {
+    const quizGen: any = await generateLLM({
+      input: buildSceneQuizPrompt(scenes),
+      max_output_tokens: 8000,
+      jsonSchema: QUIZ_JSON_SCHEMA,
+    } as any);
+    const parsedQuiz = parseScenesJson(quizGen.output_text);
+    quizQuestions = Array.isArray(parsedQuiz?.questions) ? parsedQuiz.questions : [];
+  } catch {
+    quizQuestions = [];
+  }
+
+  // 3) 웹 scene → raw idea/clip/scene 매핑 (idea = 소단원 1개, clip 1개, scene = slide)
+  const rawIdeas = scenes.map((scene, i) => {
+    const chapter = parseSceneNumberedTitle(scene.chapterTitle || "");
+    const subsection = parseSceneNumberedTitle(scene.subsectionTitle || scene.title || "");
+    const chapterTitle = chapter.title || "학습 주제";
+    const subTitle = subsection.title || scene.title || chapterTitle;
+    const narration = String(scene.narration || "");
+    const len = Math.max(narration.length, 1);
+    const slides: any[] =
+      Array.isArray(scene.slides) && scene.slides.length
+        ? scene.slides
+        : [{ imagePrompt: "", narrationMarker: "", startRatio: 0 }];
+    const rawScenes = slides.map((slide, j) => {
+      const startPos = Math.round((Number(slide.startRatio) || 0) * len);
+      const endPos =
+        j + 1 < slides.length ? Math.round((Number(slides[j + 1].startRatio) || 0) * len) : len;
+      const slice = narration.slice(startPos, Math.max(startPos, endPos)).trim() || narration;
+      return {
+        id: `sc-${i + 1}-scene-${j + 1}`,
+        order: j + 1,
+        headline: subTitle,
+        body: slice.slice(0, 60),
+        narration: slice,
+        callouts: [],
+        captionLines: [slice.slice(0, 22)],
+        __imagePrompt: String(slide.imagePrompt || ""),
+        __startRatio: Number(slide.startRatio) || 0,
+      };
+    });
+    const durationSec = Math.max(30, Math.min(120, Math.round(narration.length / 6) || 45));
+    return {
+      section: `${chapter.number ? chapter.number + " " : ""}${chapterTitle}`.trim(),
+      title: subTitle.trim(),
+      teaser: subTitle,
+      durationSec,
+      clips: [
+        {
+          title: subTitle.trim(),
+          teaser: subTitle,
+          durationSec,
+          narrationScript: narration,
+          scenes: rawScenes,
+          tts: { provider: "openai-tts", audioStatus: "pending", segments: [] },
+        },
+      ],
+      quiz: { questions: [] },
+    };
+  });
+
+  // 4) 정규화 (기존 파이프라인 재사용)
+  const pack: any = normalizePack(
+    { format: "shorts", title, ideas: rawIdeas },
+    { title, author, category },
+    languageProfile,
+    "shorts"
+  );
+
+  // 5) 후처리: 정규화가 떨군 웹 imagePrompt·startRatio 세그먼트·4지선다 퀴즈 주입
+  (pack.ideas || []).forEach((idea: any, i: number) => {
+    const scene = scenes[i];
+    const rawScenesForIdea: any[] = rawIdeas[i]?.clips?.[0]?.scenes || [];
+    const wq = quizQuestions[i];
+    if (wq && Array.isArray(wq.options) && wq.options.length >= 2) {
+      idea.quiz = {
+        questions: [
+          {
+            id: `quiz-${i + 1}`,
+            question: String(wq.q || wq.question || ""),
+            options: wq.options.map((o: any) => String(o)),
+            correctIndex: Math.max(
+              0,
+              Math.min(wq.options.length - 1, Number(wq.answer ?? wq.correctIndex ?? 0))
+            ),
+            explanation: String(wq.explanation || ""),
+            conceptTitle: String(wq.conceptTitle || ""),
+          },
+        ],
+      };
+    }
+    const clip = (idea.clips && idea.clips[0]) || null;
+    if (clip && Array.isArray(clip.scenes)) {
+      const segments = clip.scenes.map((cs: any, j: number) => {
+        const rawScene = rawScenesForIdea[j];
+        if (rawScene) cs.imagePrompt = rawScene.__imagePrompt;
+        return {
+          id: `${clip.id}-segment-${j + 1}`,
+          sceneId: cs.id,
+          order: j + 1,
+          text: cs.narration,
+          startMs: 0,
+          endMs: 0,
+          startRatio: rawScene ? rawScene.__startRatio : j === 0 ? 0 : j / clip.scenes.length,
+        };
+      });
+      clip.tts = {
+        ...(clip.tts || {}),
+        provider: clip.tts?.provider || "openai-tts",
+        audioStatus: "pending",
+        durationMs: 0,
+        segments,
+      };
+      clip.narrationScript = String(scene?.narration || clip.narrationScript || "");
+      if (idea.short) idea.short = { ...clip };
+    }
+  });
+
+  return { debug: { brain: "scenes", sceneCount: scenes.length }, languageProfile, pack, sectionHeadingHints: [] };
+}
+
 export async function generatePackFromSource({
   title,
   author,
@@ -1745,8 +2811,22 @@ export async function generatePackFromSource({
   generateLLM: GenerateLLM;
   onProgress?: (patch: ProgressPatch) => void | Promise<void>;
 }) {
+  if (packFormat === "deck") {
+    return generateDeckPackFromSource({
+      title,
+      author,
+      category,
+      sourceText,
+      geminiFileBuffer,
+      geminiFileMimeType,
+      generateLLM,
+      onProgress,
+    });
+  }
+
   if (packFormat === "shorts") {
-    return generateShortsPackFromSource({
+    // 웹 로직 기반 새 brain 사용 (레거시 generateShortsPackFromSource 대체)
+    return generateShortsPackFromScenes({
       title,
       author,
       category,
@@ -1762,7 +2842,7 @@ export async function generatePackFromSource({
   const languageProfile = isMultimodal ? UNKNOWN_LANGUAGE_PROFILE : detectSourceLanguage(sourceText);
   const sectionHeadingHints = isMultimodal ? [] : extractSectionHeadingHints(sourceText, languageProfile);
   const skipChunking = isMultimodal;
-  const chunks = skipChunking ? [sourceText] : splitSourceIntoChunks(sourceText);
+  const chunks = skipChunking ? [sourceText] : splitSourceIntoChunks(sourceText, (generateLLM as any).__modelId);
   const debug = buildDebugPayload({ sourceText, sectionHeadingHints, chunks, isMultimodal });
 
   await onProgress?.({ debug });

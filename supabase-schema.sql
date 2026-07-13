@@ -47,6 +47,16 @@ create table generation_jobs (
   updated_at timestamptz default now()
 );
 
+-- 6. Expo 푸시 알림 토큰
+create table push_tokens (
+  token text primary key,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  platform text default 'unknown',
+  enabled boolean default true,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now()
+);
+
 -- ============================================================
 -- RLS (Row Level Security)
 -- ============================================================
@@ -69,6 +79,9 @@ create policy "Users can CRUD own preferences" on user_preferences
 
 -- generation_jobs is intended for server/service-role access.
 alter table generation_jobs enable row level security;
+
+-- push_tokens is written by the server after verifying the user's access token.
+alter table push_tokens enable row level security;
 
 -- ============================================================
 -- updated_at 자동 갱신 트리거
@@ -98,6 +111,10 @@ create trigger generation_jobs_updated_at
   before update on generation_jobs
   for each row execute function update_updated_at();
 
+create trigger push_tokens_updated_at
+  before update on push_tokens
+  for each row execute function update_updated_at();
+
 -- user_progress uses last_touched_at instead of updated_at
 create or replace function update_last_touched_at()
 returns trigger as $$
@@ -119,3 +136,4 @@ create index packs_user_id_idx on packs(user_id);
 create index user_progress_user_id_idx on user_progress(user_id);
 create index idea_chats_user_id_pack_id_idx on idea_chats(user_id, pack_id);
 create index generation_jobs_updated_at_idx on generation_jobs(updated_at desc);
+create index push_tokens_user_id_idx on push_tokens(user_id);

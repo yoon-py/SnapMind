@@ -20,7 +20,11 @@
       "infoPlist": {
         "NSCameraUsageDescription": "사진을 촬영하여 학습 자료로 변환합니다.",
         "NSPhotoLibraryUsageDescription": "사진을 선택하여 학습 자료로 변환합니다.",
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSAppTransportSecurity": {
+          "NSAllowsLocalNetworking": true,
+          "NSAllowsArbitraryLoads": true
+        }
       }
     },
     "android": {
@@ -38,7 +42,8 @@
     "plugins": [
       "expo-web-browser",
       "expo-localization",
-      "expo-audio"
+      "expo-audio",
+      "expo-notifications"
     ],
     "extra": {
       "eas": {

@@ -410,7 +410,9 @@ function buildPreviewHtml({
         const currentMs = (audio.currentTime || 0) * 1000;
         const index = slides.findIndex((slide, slideIndex) => {
           const next = slides[slideIndex + 1];
-          const endMs = slide.endMs || next?.startMs || Number.MAX_SAFE_INTEGER;
+          const ownEndMs = Math.max(slide.startMs || 0, slide.endMs || 0);
+          const nextStartMs = next ? Math.max(ownEndMs, next.startMs || 0) : 0;
+          const endMs = nextStartMs || ownEndMs || Number.MAX_SAFE_INTEGER;
           return currentMs >= slide.startMs && currentMs < endMs;
         });
         if (index >= 0 && index !== activeIndex) {

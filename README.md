@@ -1,14 +1,14 @@
 # SnapMind
 
-**아무 문서나 넣으면, AI가 모바일 학습 콘텐츠로 바꿔주는 앱**
+**텍스트가 추출 가능한 문서를 넣으면, AI가 모바일 학습 콘텐츠로 바꿔주는 앱**
 
-PDF, Word, HWP, PPT, 이미지 등 다양한 형식의 문서를 업로드하면 AI(OpenAI / Gemini)가 내용을 분석해서 짧은 숏폼 학습 카드("Shorts")나 플래시카드("Cards")로 자동 변환해 줍니다. 변환된 콘텐츠는 스마트폰에서 스와이프하며 학습할 수 있고, 각 아이디어에 대해 AI 튜터와 1:1 채팅으로 더 깊이 이해할 수도 있습니다.
+PDF, Word, HWP, PPT, 이미지 등 다양한 형식의 문서를 업로드하면 AI(OpenAI / Gemini)가 내용을 분석해서 짧은 숏폼 학습 카드("Shorts")나 플래시카드("Cards")로 자동 변환해 줍니다. PDF는 텍스트 레이어가 있는 파일은 기본 파서로 처리하고, 스캔본/이미지 기반 PDF는 Google Document AI 또는 Upstage OCR 설정이 필요합니다. 변환된 콘텐츠는 스마트폰에서 스와이프하며 학습할 수 있고, 각 아이디어에 대해 AI 튜터와 1:1 채팅으로 더 깊이 이해할 수도 있습니다.
 
 ---
 
 ## 주요 기능
 
-- **문서 → 학습팩 자동 변환**: 텍스트를 직접 붙여넣거나, PDF · DOCX · HWP · PPTX · XLSX · 이미지(JPG/PNG) · TXT · CSV · JSON · HTML 등 20종 이상의 파일을 업로드하면 AI가 핵심 내용을 추출하고 학습 가능한 단위로 재구성합니다.
+- **문서 → 학습팩 자동 변환**: 텍스트를 직접 붙여넣거나, 텍스트 기반 PDF · DOCX · HWP · PPTX · XLSX · TXT · CSV · JSON · HTML 등을 업로드하면 AI가 핵심 내용을 추출하고 학습 가능한 단위로 재구성합니다. 스캔 PDF와 이미지는 OCR 설정이 필요합니다.
 - **숏폼(Shorts) / 카드(Cards) 두 가지 학습 포맷**: Shorts는 짧은 영상처럼 스와이프하며 배우는 형식, Cards는 플래시카드 스타일로 핵심 개념을 빠르게 복습하는 형식입니다.
 - **AI 아이디어 채팅**: 학습 중 이해가 안 되는 개념이 있으면, 해당 아이디어를 탭해서 AI 튜터와 실시간 대화를 나눌 수 있습니다.
 - **TTS 오디오 생성**: Gemini TTS를 활용해 Shorts 콘텐츠에 자동 음성을 입혀 귀로 들으며 학습할 수 있습니다.
@@ -16,7 +16,7 @@ PDF, Word, HWP, PPT, 이미지 등 다양한 형식의 문서를 업로드하면
 - **진도 관리**: 팩별로 학습 완료한 아이디어를 추적하고, 복습 문제로 이해도를 확인합니다.
 - **다국어 지원**: 앱 UI는 한국어/영어 전환 가능. 기본 제공 팩은 다국어, 사용자 생성 팩은 원본 언어를 유지합니다.
 - **Google 로그인 + Supabase 동기화**: 기기 간 학습 데이터를 동기화할 수 있습니다.
-- **OCR 지원**: 이미지나 스캔된 PDF도 Google Document AI / Upstage OCR로 텍스트를 추출합니다.
+- **OCR 지원**: 이미지나 스캔된 PDF는 Google Document AI / Upstage OCR 설정이 있을 때 텍스트를 추출합니다.
 
 ## 기술 스택
 
@@ -87,7 +87,7 @@ cp .env.example .env
 | `EXPO_PUBLIC_API_URL` | 앱에서 백엔드 접속 URL |
 | `EXPO_PUBLIC_SUPABASE_URL` | Supabase 프로젝트 URL |
 | `EXPO_PUBLIC_SUPABASE_ANON_KEY` | Supabase anon 키 |
-| `UPSTAGE_API_KEY` | PDF OCR 폴백용 (선택) |
+| `UPSTAGE_API_KEY` | 스캔 PDF/이미지 기반 PDF OCR 폴백용. 텍스트 PDF만 처리할 경우 선택, 스캔 PDF를 처리하려면 필요 |
 
 **`EXPO_PUBLIC_API_URL` 설정 팁:**
 - iOS 시뮬레이터: `http://127.0.0.1:8788`

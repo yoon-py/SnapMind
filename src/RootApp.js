@@ -26,11 +26,13 @@ import {
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import { Feather, MaterialIcons } from "@expo/vector-icons";
+import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { learningPacks } from "./data/learningContent";
 import { useRootAppController } from "./hooks/useRootAppController";
+import { SceneSlide } from "./components/slides/SceneSlide";
 
-const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || "http://127.0.0.1:8788";
+const API_BASE_URL = resolveApiBaseUrl();
 const GEMINI_LOGO_URL =
   "https://unpkg.com/@lobehub/icons-static-png@latest/light/gemini-color.png";
 const OPENAI_BLOSSOM_ICON = require("../assets/openai-blossom.png");
@@ -101,19 +103,64 @@ const BINARY_UPLOAD_EXTENSIONS = new Set([
   "jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif",
   "txt", "md", "markdown", "csv", "html", "htm", "xml", "rtf",
 ]);
+const WEB_STUDIO_FORMATS = [
+  { id: "shorts", icon: "🎬", name: "쇼츠", desc: "TTS + 이미지" },
+];
+const WEB_GENERATION_STEPS = [
+  { id: "analysis", icon: "📄", name: "텍스트 분석", waiting: "대기 중..." },
+  { id: "script", icon: "✍️", name: "스크립트 생성", waiting: "대기 중..." },
+  { id: "tts", icon: "🎙️", name: "음성 합성 (TTS)", waiting: "대기 중..." },
+  { id: "image", icon: "🖼️", name: "이미지 생성", waiting: "대기 중..." },
+  { id: "quiz", icon: "🧠", name: "퀴즈 생성", waiting: "대기 중..." },
+];
+
+function resolveApiBaseUrl() {
+  const configured = process.env.EXPO_PUBLIC_API_URL || "http://127.0.0.1:8788";
+
+  if (Platform.OS === "web" || !__DEV__) {
+    return configured;
+  }
+
+  try {
+    const apiUrl = new URL(configured);
+    if (!["127.0.0.1", "localhost"].includes(apiUrl.hostname)) {
+      return configured;
+    }
+
+    const candidateHref =
+      globalThis?.window?.location?.href ||
+      globalThis?.window?.location?.host ||
+      "";
+
+    if (!candidateHref || !String(candidateHref).startsWith("http")) {
+      return configured;
+    }
+
+    const metroUrl = new URL(candidateHref);
+    if (!metroUrl.hostname || ["127.0.0.1", "localhost"].includes(metroUrl.hostname)) {
+      return configured;
+    }
+
+    apiUrl.hostname = metroUrl.hostname;
+    return apiUrl.toString().replace(/\/$/, "");
+  } catch {
+    return configured;
+  }
+}
 
 const palette = {
-  background: "#FCFBF7",
-  surface: "#F7F4ED",
-  raised: "#FFFDFA",
-  ink: "#321007",
-  muted: "#7A6452",
-  line: "#E7DDCF",
-  accent: "#C98706",
-  accentSoft: "#F1E2C4",
+  background: "#FFFDF4",
+  surface: "#F8FAF2",
+  raised: "#FFFFFF",
+  ink: "#153A5B",
+  muted: "#4A6A82",
+  line: "#E8E2D4",
+  accent: "#D4A400",
+  accentSoft: "#F5EBC5",
+  teal: "#1B8AA6",
   success: "#1FA95C",
   danger: "#D35E3C",
-  shadow: "#52210B",
+  shadow: "#153A5B",
 };
 
 function withAlpha(color, alpha) {
@@ -278,6 +325,36 @@ async function readSourceTextFromAsset(asset) {
   return response.text();
 }
 
+async function prepareSourceUploadFromAsset(asset, appText) {
+  if (!isSupportedSourceAsset(asset)) {
+    throw new Error(appText.unsupportedFile);
+  }
+
+  const binaryUpload = isBinaryAsset(asset);
+  let text = "";
+
+  if (!binaryUpload) {
+    text = normalizeSourceText(await readSourceTextFromAsset(asset));
+  }
+
+  if (!binaryUpload && !text) {
+    throw new Error(appText.selectedFileEmpty);
+  }
+
+  return {
+    sourceFile: {
+      asset,
+      characterCount: text.length,
+      isBinary: binaryUpload,
+      mimeType: asset.mimeType || "text/plain",
+      name: asset.name || appText.chooseSourceDocument,
+      size: asset.size,
+    },
+    sourceText: text,
+    title: inferTitleFromFileName(asset.name || ""),
+  };
+}
+
 function getPackById(packs, packId) {
   return packs.find((pack) => pack.id === packId) || packs[0];
 }
@@ -306,15 +383,32 @@ function parseStoredValue(rawValue, fallback) {
 }
 
 function getPackFormat(pack) {
-  return pack?.format === "shorts" ? "shorts" : "cards";
+  return pack?.format === "shorts" ? "shorts" : pack?.format === "deck" ? "deck" : "cards";
 }
 
 function isShortsPack(pack) {
   return getPackFormat(pack) === "shorts";
 }
 
+function isDeckPack(pack) {
+  return getPackFormat(pack) === "deck";
+}
+
+function getDeckSlides(pack) {
+  return Array.isArray(pack?.slides) ? pack.slides : [];
+}
+
+function getDeckSlideForIdea(pack, idea) {
+  const slides = getDeckSlides(pack);
+  return slides.find((slide) => slide.id === idea?.deckSlideId || slide.id === idea?.id) || slides[0] || null;
+}
+
+function getDeckSlideVisual(slide) {
+  return slide?.visual && typeof slide.visual === "object" ? slide.visual : null;
+}
+
 function normalizeRequestedPackFormat(packFormat) {
-  return packFormat === "cards" ? "cards" : "shorts";
+  return ["cards", "shorts", "deck"].includes(packFormat) ? packFormat : "shorts";
 }
 
 function getIdeaShort(idea) {
@@ -387,10 +481,6 @@ function getHomeFeaturedPack(packs, progressByPack) {
   }
 
   return incompleteReadyPacks[0] || readyPacks[0] || packs[0];
-}
-
-function isIdeaUnlocked(index, completedIdeaIds) {
-  return index <= completedIdeaIds.length;
 }
 
 function getNextIdea(pack, completedIdeaIds) {
@@ -467,8 +557,8 @@ function shuffleOptions(options, correctIndex) {
 function getPracticeQuestions(idea) {
   if (Array.isArray(idea?.quiz?.questions) && idea.quiz.questions.length > 0) {
     return idea.quiz.questions.map((question, index) => {
-      const options = Array.isArray(question.options) ? question.options.slice(0, 3) : [];
-      const correctIdx = Math.max(0, Math.min(2, Number(question.correctIndex || 0)));
+      const options = Array.isArray(question.options) ? question.options.slice(0, 4) : [];
+      const correctIdx = Math.max(0, Math.min(options.length - 1, Number(question.correctIndex || 0)));
       const shuffled = shuffleOptions(options, correctIdx);
 
       return {
@@ -490,8 +580,8 @@ function getPracticeQuestions(idea) {
         : [];
 
   return rawQuestions.map((question, index) => {
-    const options = Array.isArray(question.options) ? question.options.slice(0, 3) : [];
-    const correctIdx = Math.max(0, Math.min(2, Number(question.correctIndex || 0)));
+    const options = Array.isArray(question.options) ? question.options.slice(0, 4) : [];
+    const correctIdx = Math.max(0, Math.min(options.length - 1, Number(question.correctIndex || 0)));
     const shuffled = shuffleOptions(options, correctIdx);
 
     return {
@@ -502,6 +592,12 @@ function getPracticeQuestions(idea) {
       explanation: question.explanation || "",
     };
   });
+}
+
+// 팩(모든 쇼츠/idea)의 퀴즈 문제를 순서대로 합쳐서 마지막에 한 번에 풀 통합 퀴즈를 만든다.
+function getAllPackQuestions(pack) {
+  const ideas = Array.isArray(pack?.ideas) ? pack.ideas : [];
+  return ideas.flatMap((idea) => getPracticeQuestions(idea));
 }
 
 function normalizeQuizQuestion(question, fallbackId) {
@@ -525,7 +621,7 @@ function normalizeQuizQuestion(question, fallbackId) {
 }
 
 function getPackReviewQuestions(pack) {
-  if (isShortsPack(pack)) {
+  if (isShortsPack(pack) || isDeckPack(pack)) {
     return [];
   }
 
@@ -700,7 +796,9 @@ function getShortSceneActiveIndex(short, currentTimeSec) {
   const currentTimeMs = Math.max(0, Math.round(Number(currentTimeSec || 0) * 1000));
   const matchedSegmentIndex = segments.findIndex((segment, index) => {
     const nextSegment = segments[index + 1];
-    const endMs = segment.endMs || nextSegment?.startMs || Number.MAX_SAFE_INTEGER;
+    const ownEndMs = Math.max(segment.startMs, Number(segment.endMs || 0));
+    const nextStartMs = nextSegment ? Math.max(ownEndMs, Number(nextSegment.startMs || 0)) : 0;
+    const endMs = nextStartMs || ownEndMs || Number.MAX_SAFE_INTEGER;
     return currentTimeMs >= segment.startMs && currentTimeMs < endMs;
   });
 
@@ -732,8 +830,9 @@ function getShortActiveSegment(segments, currentTimeMs) {
   const matchedSegment = segments.find((segment, index) => {
     const nextSegment = segments[index + 1];
     const startMs = Math.max(0, Number(segment?.startMs || 0));
-    const fallbackEndMs = nextSegment?.startMs || Number.MAX_SAFE_INTEGER;
-    const endMs = Math.max(startMs, Number(segment?.endMs || fallbackEndMs));
+    const ownEndMs = Math.max(startMs, Number(segment?.endMs || 0));
+    const nextStartMs = nextSegment ? Math.max(ownEndMs, Number(nextSegment.startMs || 0)) : 0;
+    const endMs = nextStartMs || ownEndMs || Number.MAX_SAFE_INTEGER;
     return targetMs >= startMs && targetMs < endMs;
   });
 
@@ -858,17 +957,20 @@ const APP_UI_COPY = {
       "Choose the fastest way to start. You can still edit the title and other details on the next screen.",
     packFormatTitle: "Choose the output style",
     packFormatBody:
-      "Cards turn the source into lesson cards and review. Shorts turn it into a vertical storyboard, narration, and quiz.",
+      "Cards build step-by-step study. Shorts create narrated clips. Decks turn the source into visual slides.",
     packFormatShortsTitle: "Short video",
     packFormatShortsBody: "Scenes, TTS, images, and a quiz for a vertical lesson short.",
     packFormatCardsTitle: "Card pack",
     packFormatCardsBody: "Lesson cards, review prompts, and practice questions for step-by-step study.",
+    packFormatDeckTitle: "Slide deck",
+    packFormatDeckBody: "Blueprint-style visual slides with diagrams, tables, and presenter notes.",
     packFormatShortsChip: "SHORTS",
     packFormatCardsChip: "CARDS",
+    packFormatDeckChip: "DECK",
     quickCreateTextTitle: "Paste text",
     quickCreateTextBody: "Start from notes, excerpts, or chapter text.",
     quickCreateFileTitle: "Upload a file",
-    quickCreateFileBody: "Use PDF, DOCX, HWP, or text-based files such as .txt, .md, .csv, or .html.",
+    quickCreateFileBody: "Use text PDFs, DOCX, HWP, or text-based files such as .txt, .md, .csv, or .html.",
     quickCreateAdvanced: "Open full studio",
     ideasDone(completed, total) {
       return `${completed}/${total} ideas done`;
@@ -878,7 +980,7 @@ const APP_UI_COPY = {
     backendTargetKicker: "Backend target",
     backendTargetTitle: "Generate a new learning pack",
     backendTargetBody:
-      "The app sends your source to the backend, which returns either lesson cards or a short-video storyboard with audio and quiz data.",
+      "The app sends your source to the backend, which returns lesson cards, a narrated short storyboard, or a visual slide deck.",
     apiBaseUrl: "API base URL",
     apiBaseUrlHint: "Use your Mac's local IP instead of localhost when testing on a real phone.",
     packTitle: "Pack title",
@@ -904,10 +1006,11 @@ const APP_UI_COPY = {
     supportedUploadHint: "Upload .pdf, .docx, .hwp, .txt, .md, .csv, .json, .html, .xml, or .rtf",
     uploadLargeFileWarning: "Very large files may result in some content being omitted.",
     ocrLanguageHint: "Scanned PDFs and images support Korean and English only.",
+    ocrConfigHint: "Scanned or image-based PDFs require OCR credentials such as UPSTAGE_API_KEY.",
     pdfUpload: "PDF upload",
     preview: "Preview",
     pdfPreviewBody:
-      "This PDF will be uploaded to the backend, converted to text, and then used to generate the learning pack.",
+      "This PDF will be uploaded to the backend. Text PDFs work directly; scanned PDFs require OCR credentials.",
     chooseAnotherFile: "Choose another file",
     removeFile: "Remove file",
     fileHint() {
@@ -987,17 +1090,20 @@ const APP_UI_COPY = {
       "가장 빠른 시작 방법을 골라보세요. 제목이나 세부 정보는 다음 화면에서 바꿀 수 있어요.",
     packFormatTitle: "결과 형식 고르기",
     packFormatBody:
-      "카드형은 레슨 카드와 복습 중심으로 만들고, 쇼츠형은 세로 영상용 장면과 내레이션, 퀴즈 중심으로 만들어요.",
+      "카드형은 차근차근 학습, 쇼츠형은 내레이션 클립, 덱형은 시각자료 중심 슬라이드로 만들어요.",
     packFormatShortsTitle: "쇼츠형",
     packFormatShortsBody: "장면, TTS, 이미지, 퀴즈로 세로형 짧은 강의를 만들어요.",
     packFormatCardsTitle: "카드형",
     packFormatCardsBody: "레슨 카드, 복습 포인트, 연습 문제로 차근차근 공부해요.",
+    packFormatDeckTitle: "슬라이드 덱",
+    packFormatDeckBody: "도면 스타일의 슬라이드, 다이어그램, 표, 발표 노트로 정리해요.",
     packFormatShortsChip: "쇼츠",
     packFormatCardsChip: "카드",
+    packFormatDeckChip: "덱",
     quickCreateTextTitle: "텍스트 붙여넣기",
     quickCreateTextBody: "노트, 글 일부, 챕터 발췌문으로 바로 시작해요.",
     quickCreateFileTitle: "파일 업로드",
-    quickCreateFileBody: "PDF, DOCX, HWP 또는 .txt, .md, .csv, .html 같은 텍스트 파일로 시작해요.",
+    quickCreateFileBody: "텍스트 PDF, DOCX, HWP 또는 .txt, .md, .csv, .html 같은 텍스트 파일로 시작해요.",
     quickCreateAdvanced: "전체 스튜디오 열기",
     ideasDone(completed, total) {
       return `${completed}/${total} 아이디어 완료`;
@@ -1007,7 +1113,7 @@ const APP_UI_COPY = {
     backendTargetKicker: "백엔드 연결",
     backendTargetTitle: "새 학습 팩 만들기",
     backendTargetBody:
-      "앱이 원문을 백엔드로 보내면, 백엔드가 카드형 학습 데이터나 쇼츠형 강의 스토리보드와 오디오, 퀴즈 데이터로 바꿔줘요.",
+      "앱이 원문을 백엔드로 보내면, 카드형 학습 데이터, 쇼츠형 강의 스토리보드, 또는 시각 슬라이드 덱으로 바꿔줘요.",
     apiBaseUrl: "API 주소",
     apiBaseUrlHint: "실기기 테스트에서는 localhost 대신 맥의 로컬 IP를 쓰는 게 안전해요.",
     packTitle: "팩 제목",
@@ -1033,10 +1139,11 @@ const APP_UI_COPY = {
     supportedUploadHint: ".pdf, .docx, .hwp, .txt, .md, .csv, .json, .html, .xml, .rtf 업로드 가능",
     uploadLargeFileWarning: "너무 많은 분량의 파일을 업로드하면 일부 내용이 누락될 수 있습니다.",
     ocrLanguageHint: "스캔된 PDF·이미지는 한국어, 영어만 지원됩니다.",
+    ocrConfigHint: "스캔 PDF나 이미지 기반 PDF는 UPSTAGE_API_KEY 같은 OCR 설정이 필요합니다.",
     pdfUpload: "PDF 업로드",
     preview: "미리보기",
     pdfPreviewBody:
-      "이 PDF는 백엔드로 업로드된 뒤 텍스트로 변환되고, 그 텍스트로 학습 팩을 만들게 됩니다.",
+      "텍스트 PDF는 바로 처리되고, 스캔 PDF나 이미지 기반 PDF는 OCR 설정이 있어야 처리됩니다.",
     chooseAnotherFile: "다른 파일 고르기",
     removeFile: "파일 제거",
     fileHint() {
@@ -1100,7 +1207,7 @@ const LESSON_UI_COPY = {
     pauseAudio: "Pause audio",
     previousScene: "Previous scene",
     nextScene: "Next scene",
-    startQuiz: "Start quiz",
+    startQuiz: "Quiz",
     showSubtitles: "Show subtitles",
     hideSubtitles: "Hide subtitles",
     audioPreparing: "Preparing audio...",
@@ -1108,6 +1215,7 @@ const LESSON_UI_COPY = {
     continueWithoutAudio: "Continue without audio",
     continueWithoutVideo: "Continue without video",
     swipeUpForNextShort: "Swipe up for the next short",
+    scrollHint: "Scroll",
     swipeDownForPreviousShort: "Swipe down to revisit the previous short",
     lectureComplete: "Short complete",
     lectureCompleteBody: "The short lecture is finished. Take the quiz to lock it in.",
@@ -1193,8 +1301,12 @@ const LESSON_UI_COPY = {
     startReading: "Start Reading",
     continueReading: "Continue Reading",
     backHome: "Back to home",
+    finishPack: "Finish",
     reviewPack: "Review the full pack",
+    reviewCompletedPack: "Review again",
     niceWork: "Nice work",
+    packComplete: "Pack complete",
+    packCompleteBody: "You watched every short and finished the quiz. Nice clean finish.",
     completionBody:
       "You learned and practiced something new. The next idea is ready whenever you are.",
     cardLabel(index, total) {
@@ -1228,7 +1340,7 @@ const LESSON_UI_COPY = {
     pauseAudio: "오디오 멈춤",
     previousScene: "이전 장면",
     nextScene: "다음 장면",
-    startQuiz: "퀴즈 시작",
+    startQuiz: "퀴즈",
     showSubtitles: "자막 켜기",
     hideSubtitles: "자막 끄기",
     audioPreparing: "오디오 준비 중...",
@@ -1236,6 +1348,7 @@ const LESSON_UI_COPY = {
     continueWithoutAudio: "오디오 없이 계속",
     continueWithoutVideo: "영상 없이 계속",
     swipeUpForNextShort: "위로 넘겨 다음 쇼츠 보기",
+    scrollHint: "스크롤",
     swipeDownForPreviousShort: "아래로 넘겨 이전 쇼츠 다시 보기",
     lectureComplete: "쇼츠를 다 들었어요",
     lectureCompleteBody: "짧은 강의를 끝냈어요. 이제 퀴즈로 바로 확인해보세요.",
@@ -1321,8 +1434,12 @@ const LESSON_UI_COPY = {
     startReading: "학습 시작",
     continueReading: "이어서 보기",
     backHome: "홈으로",
+    finishPack: "끝내기",
     reviewPack: "팩 전체 다시 보기",
+    reviewCompletedPack: "다시 복습하기",
     niceWork: "좋았어요",
+    packComplete: "완료했어요",
+    packCompleteBody: "쇼츠를 끝까지 보고 퀴즈까지 마쳤어요. 전체 흐름이 잘 정리됐습니다.",
     completionBody:
       "하나를 더 배우고 바로 연습까지 마쳤어요. 다음 아이디어도 이어서 볼 수 있어요.",
     cardLabel(index, total) {
@@ -1362,7 +1479,7 @@ const LESSON_UI_COPY = {
     pauseAudio: "Pause lyd",
     previousScene: "Forrige scene",
     nextScene: "Næste scene",
-    startQuiz: "Start quiz",
+    startQuiz: "Quiz",
     showSubtitles: "Vis undertekster",
     hideSubtitles: "Skjul undertekster",
     audioPreparing: "Forbereder lyd...",
@@ -1370,6 +1487,7 @@ const LESSON_UI_COPY = {
     continueWithoutAudio: "Fortsæt uden lyd",
     continueWithoutVideo: "Fortsæt uden video",
     swipeUpForNextShort: "Stryg op for naeste korte lektion",
+    scrollHint: "Rul",
     swipeDownForPreviousShort: "Stryg ned for at se den forrige korte lektion igen",
     lectureComplete: "Kort lektion færdig",
     lectureCompleteBody: "Den korte lektion er færdig. Tag quizzen for at fastholde det vigtigste.",
@@ -1455,8 +1573,13 @@ const LESSON_UI_COPY = {
     startReading: "Begynd at læse",
     continueReading: "Fortsæt med at læse",
     backHome: "Til forsiden",
+    finishPack: "Afslut",
     reviewPack: "Gennemga hele pakken",
+    reviewCompletedPack: "Gennemga igen",
     niceWork: "Flot arbejde",
+    packComplete: "Pakken er gennemført",
+    packCompleteBody:
+      "Du har set alle shorts og gennemført quizzen. Hele forløbet er samlet.",
     completionBody:
       "Du lærte noget nyt og fik øvet det med det samme. Den næste ide er klar, når du er.",
     cardLabel(index, total) {
@@ -1541,14 +1664,26 @@ function getPackDisplaySubtitle(pack) {
   const languageCode = inferLessonLanguage(getPackSampleText(pack));
 
   if (languageCode === "ko") {
-    return isShortsPack(pack) ? `${title} 쇼츠로 이해하기` : `${title}를 쉽게 이해하기`;
+    return isShortsPack(pack)
+      ? `${title} 쇼츠로 이해하기`
+      : isDeckPack(pack)
+        ? `${title} 슬라이드로 이해하기`
+        : `${title}를 쉽게 이해하기`;
   }
 
   if (languageCode === "da") {
-    return isShortsPack(pack) ? `Forstå ${title} i korte lektioner` : `Forstå ${title}`;
+    return isShortsPack(pack)
+      ? `Forstå ${title} i korte lektioner`
+      : isDeckPack(pack)
+        ? `Forstå ${title} som slides`
+        : `Forstå ${title}`;
   }
 
-  return isShortsPack(pack) ? `Learn ${title} as short lessons` : `Understanding ${title}`;
+  return isShortsPack(pack)
+    ? `Learn ${title} as short lessons`
+    : isDeckPack(pack)
+      ? `Learn ${title} as visual slides`
+      : `Understanding ${title}`;
 }
 
 function getLessonSampleText(pack, idea) {
@@ -1810,61 +1945,43 @@ function LanguagePicker({ appLanguage, appText, onChangeLanguage, compact }) {
 }
 
 function PackFormatPicker({ appText, selectedPackFormat, onChange, compact = false }) {
+  const isActive = selectedPackFormat === "shorts";
+
   return (
     <View style={[styles.packFormatCard, compact && styles.packFormatCardCompact]}>
       {compact ? null : (
         <>
-          <Text style={styles.packFormatLabel}>{appText.packFormatTitle}</Text>
-          <Text style={styles.packFormatBody}>{appText.packFormatBody}</Text>
+          <Text style={styles.packFormatLabel}>{appText.packFormatShortsTitle}</Text>
+          <Text style={styles.packFormatBody}>{appText.packFormatShortsBody}</Text>
         </>
       )}
 
       <View style={[styles.packFormatRow, compact && styles.packFormatRowCompact]}>
-        {[
-          {
-            value: "shorts",
-            label: appText.packFormatShortsTitle,
-            body: appText.packFormatShortsBody,
-            icon: "smart-display",
-          },
-          {
-            value: "cards",
-            label: appText.packFormatCardsTitle,
-            body: appText.packFormatCardsBody,
-            icon: "style",
-          },
-        ].map((option) => {
-          const isActive = selectedPackFormat === option.value;
-
-          return (
-            <Pressable
-              key={option.value}
-              accessibilityRole="button"
-              onPress={() => onChange(option.value)}
-              style={[
-                styles.packFormatOption,
-                compact && styles.packFormatOptionCompact,
-                isActive && styles.packFormatOptionActive,
-              ]}
-            >
-              <View style={[styles.packFormatIconWrap, isActive && styles.packFormatIconWrapActive]}>
-                <MaterialIcons
-                  color={isActive ? "#FFF8EA" : palette.accent}
-                  name={option.icon}
-                  size={18}
-                />
-              </View>
-              <View style={styles.packFormatTextWrap}>
-                <Text style={[styles.packFormatOptionTitle, isActive && styles.packFormatOptionTitleActive]}>
-                  {option.label}
-                </Text>
-                <Text style={[styles.packFormatOptionBody, isActive && styles.packFormatOptionBodyActive]}>
-                  {option.body}
-                </Text>
-              </View>
-            </Pressable>
-          );
-        })}
+        <Pressable
+          accessibilityRole="button"
+          onPress={() => onChange("shorts")}
+          style={[
+            styles.packFormatOption,
+            compact && styles.packFormatOptionCompact,
+            isActive && styles.packFormatOptionActive,
+          ]}
+        >
+          <View style={[styles.packFormatIconWrap, isActive && styles.packFormatIconWrapActive]}>
+            <MaterialIcons
+              color={isActive ? "#FFF8EA" : palette.accent}
+              name="smart-display"
+              size={18}
+            />
+          </View>
+          <View style={styles.packFormatTextWrap}>
+            <Text style={[styles.packFormatOptionTitle, isActive && styles.packFormatOptionTitleActive]}>
+              {appText.packFormatShortsTitle}
+            </Text>
+            <Text style={[styles.packFormatOptionBody, isActive && styles.packFormatOptionBodyActive]}>
+              {appText.packFormatShortsBody}
+            </Text>
+          </View>
+        </Pressable>
       </View>
     </View>
   );
@@ -1917,7 +2034,6 @@ function CreatePackSheet({
               <Text style={styles.createSheetPillLabel}>{appText.quickCreateTextTitle}</Text>
             </Pressable>
 
-            <Text style={{ fontSize: 11, color: palette.muted, textAlign: "center", marginTop: 12 }}>{appText.ocrLanguageHint}</Text>
           </View>
         </SafeAreaView>
       </View>
@@ -2017,6 +2133,194 @@ function BookCover({ pack, compact }) {
   );
 }
 
+function WebLogo() {
+  return (
+    <Text style={styles.webLogo}>
+      Snap<Text style={styles.webLogoAccent}>Mind</Text>
+    </Text>
+  );
+}
+
+function WebTabBar({ active, onHome, onCreate, onPacks, onProfile }) {
+  const tabs = [
+    { id: "home", icon: "🏠", label: "홈", onPress: onHome },
+    { id: "create", icon: "✨", label: "생성", onPress: onCreate },
+    { id: "packs", icon: "📚", label: "팩", onPress: onPacks },
+    { id: "profile", icon: "👤", label: "프로필", onPress: onProfile },
+  ];
+
+  return (
+    <View style={styles.webTabBar}>
+      {tabs.map((tab) => {
+        const isActive = active === tab.id;
+        return (
+          <Pressable
+            key={tab.id}
+            accessibilityRole="button"
+            onPress={tab.onPress}
+            style={styles.webTabItem}
+          >
+            <Text style={styles.webTabIcon}>{tab.icon}</Text>
+            <Text style={[styles.webTabLabel, isActive && styles.webTabLabelActive]}>
+              {tab.label}
+            </Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
+function getPackWebMeta(pack) {
+  const packFormat = getPackFormat(pack);
+  if (packFormat === "cards") {
+    const cardCount = (pack.ideas || []).reduce(
+      (sum, idea) => sum + (idea.lessonCards?.length || 0),
+      0
+    );
+    return `${pack.ideas?.length || 0}개 개념 · ${cardCount}장 카드`;
+  }
+
+  const sections = getPackTocSections(pack);
+  const detailCount = sections.reduce((sum, section) => sum + section.ideas.length, 0);
+  return `${sections.length}개 대단원 · ${detailCount}개 목차 · ${pack.ideas?.length || 0}개 쇼츠`;
+}
+
+function splitSectionLabel(section, fallbackIndex) {
+  const raw = String(section || "").trim();
+  const match = raw.match(/^(\d+(?:\.\d+)?)\s+(.+)$/u);
+  if (match) {
+    return {
+      number: match[1].padStart(2, "0"),
+      title: match[2].trim(),
+    };
+  }
+
+  return {
+    number: String(fallbackIndex + 1).padStart(2, "0"),
+    title: raw || "학습 주제",
+  };
+}
+
+function getPackTocSections(pack) {
+  const groups = [];
+  const groupByTitle = new Map();
+  const ideas = Array.isArray(pack?.ideas) ? pack.ideas : [];
+
+  ideas.forEach((idea) => {
+    const sectionKey = String(idea?.section || pack?.category || "학습 주제").trim();
+    if (!groupByTitle.has(sectionKey)) {
+      const parsed = splitSectionLabel(sectionKey, groups.length);
+      const group = {
+        id: `${pack?.id || "pack"}-section-${groups.length + 1}`,
+        number: parsed.number,
+        title: parsed.title,
+        ideas: [],
+      };
+      groupByTitle.set(sectionKey, group);
+      groups.push(group);
+    }
+
+    groupByTitle.get(sectionKey).ideas.push(idea);
+  });
+
+  if (groups.length === 0) {
+    groups.push({
+      id: `${pack?.id || "pack"}-section-1`,
+      number: "01",
+      title: pack?.title || "학습 주제",
+      ideas: [],
+    });
+  }
+
+  return groups;
+}
+
+function WebPackCard({ appText, index = 0, pack, progressByPack, onOpen, onDelete, onRename }) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [draftTitle, setDraftTitle] = useState(pack.title || "");
+  const packFormat = getPackFormat(pack);
+  const completed = getCompletedIdeaIds(progressByPack, pack.id).length;
+  const total = pack.ideas?.length || 0;
+  const progressRatio = total > 0 ? clampNumber(completed / total, 0, 1) : 0;
+  const iconName =
+    packFormat === "cards" ? "style" : packFormat === "deck" ? "slideshow" : "play-circle-filled";
+  const iconColor = packFormat === "cards" ? palette.teal : packFormat === "deck" ? palette.ink : palette.accent;
+
+  function saveTitle() {
+    const cleanTitle = draftTitle.trim();
+    if (cleanTitle && cleanTitle !== pack.title) {
+      onRename?.(cleanTitle);
+    }
+    setIsEditing(false);
+  }
+
+  return (
+    <Pressable accessibilityRole="button" onPress={onOpen} style={styles.webPackCard}>
+      <View style={[styles.webPackIcon, styles[`webPackIcon_${packFormat}`]]}>
+        <MaterialIcons color={iconColor} name={iconName} size={24} />
+      </View>
+      <View style={styles.webPackBody}>
+        <View style={styles.webPackTitleRow}>
+          {isEditing ? (
+            <TextInput
+              autoFocus
+              onBlur={saveTitle}
+              onChangeText={setDraftTitle}
+              onSubmitEditing={saveTitle}
+              returnKeyType="done"
+              style={styles.webPackTitleInput}
+              value={draftTitle}
+            />
+          ) : (
+            <Text numberOfLines={1} style={styles.webPackTitle}>
+              {pack.title || "생성된 팩"}
+            </Text>
+          )}
+          <Pressable
+            accessibilityRole="button"
+            hitSlop={8}
+            onPress={(event) => {
+              event.stopPropagation();
+              setDraftTitle(pack.title || "");
+              setIsEditing(true);
+            }}
+            style={styles.webPackEdit}
+          >
+            <Feather color={palette.muted} name="edit-2" size={15} />
+          </Pressable>
+        </View>
+        <Text numberOfLines={1} style={styles.webPackMeta}>
+          {getPackWebMeta(pack)}
+        </Text>
+        {total > 0 ? (
+          <View
+            accessibilityLabel={appText.libraryCompleted(completed, total)}
+            style={styles.webPackProgressTrack}
+          >
+            <View style={[styles.webPackProgressFill, { width: `${progressRatio * 100}%` }]} />
+            <Text style={styles.webPackProgressText}>{completed}/{total}</Text>
+          </View>
+        ) : null}
+      </View>
+      <Pressable
+        accessibilityRole="button"
+        hitSlop={8}
+        onPress={(event) => {
+          event.stopPropagation();
+          Alert.alert(appText.deletePackConfirmTitle, appText.deletePackConfirmMessage, [
+            { text: appText.deletePackCancel, style: "cancel" },
+            { text: appText.deletePackConfirm, style: "destructive", onPress: onDelete },
+          ]);
+        }}
+        style={styles.webPackDelete}
+      >
+        <Feather color={palette.muted} name="trash-2" size={14} />
+      </Pressable>
+    </Pressable>
+  );
+}
+
 function ProgressPills({ total, activeIndex }) {
   return (
     <View style={styles.progressRow}>
@@ -2040,25 +2344,20 @@ function ProgressPills({ total, activeIndex }) {
 }
 
 function IdeaRow({ idea, state, onPress }) {
-  const isLocked = state === "locked";
   const isCompleted = state === "completed";
 
   return (
     <Pressable
       accessibilityRole="button"
-      disabled={isLocked}
       onPress={onPress}
-      style={[styles.ideaRow, isLocked && styles.ideaRowLocked]}
+      style={styles.ideaRow}
     >
       <View style={styles.ideaRowLeft}>
         <View style={styles.ideaRowIconShell}>
           <MaterialIcons color={palette.accent} name={idea.icon} size={22} />
         </View>
         <View style={styles.ideaRowText}>
-          <Text
-            numberOfLines={2}
-            style={[styles.ideaRowTitle, isLocked && styles.ideaRowTitleLocked]}
-          >
+          <Text numberOfLines={2} style={styles.ideaRowTitle}>
             {idea.title}
           </Text>
           <Text style={styles.ideaRowTeaser}>{idea.teaser}</Text>
@@ -2067,8 +2366,6 @@ function IdeaRow({ idea, state, onPress }) {
 
       {isCompleted ? (
         <MaterialIcons color={palette.success} name="check-circle" size={28} />
-      ) : isLocked ? (
-        <MaterialIcons color={palette.ink} name="lock-outline" size={26} />
       ) : (
         <Feather color={palette.ink} name="chevron-right" size={24} />
       )}
@@ -2190,7 +2487,7 @@ function ShortsSeekBar({
 }
 
 /* ─── Login Screen ─── */
-function LoginScreen({ onGoogleLogin, loading, appLanguage }) {
+function LoginScreen({ onGoogleLogin, onGuestLogin, loading, appLanguage }) {
   const isKo = appLanguage === "ko";
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -2215,16 +2512,25 @@ function LoginScreen({ onGoogleLogin, loading, appLanguage }) {
               <ActivityIndicator color={palette.ink} size="small" />
             ) : (
               <>
-                <Image
-                  source={{ uri: "https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" }}
-                  style={loginStyles.googleIcon}
-                />
+                <View style={loginStyles.googleIcon}>
+                  <Text style={loginStyles.googleIconText}>G</Text>
+                </View>
                 <Text style={loginStyles.googleButtonText}>
                   {isKo ? "Google로 계속하기" : "Continue with Google"}
                 </Text>
               </>
             )}
           </Pressable>
+          {onGuestLogin && (
+            <Pressable
+              style={({ pressed }) => [loginStyles.guestButton, pressed && { opacity: 0.7 }]}
+              onPress={onGuestLogin}
+            >
+              <Text style={loginStyles.guestButtonText}>
+                {isKo ? "게스트로 시작 (로그인 없이 둘러보기)" : "Continue as guest"}
+              </Text>
+            </Pressable>
+          )}
           <Text style={loginStyles.disclaimer}>
             {isKo
               ? "계속 진행하면 서비스 이용약관에 동의하게 됩니다."
@@ -2236,70 +2542,70 @@ function LoginScreen({ onGoogleLogin, loading, appLanguage }) {
   );
 }
 
-function HomeScreen({ packs, progressByPack, onOpenPack, onRemovePack, onUpdateTitle, onOpenStudio, appLanguage, onChangeLanguage, pendingGeneration, onDismissPending, user, onLogout }) {
+function HomeScreen({
+  packs,
+  progressByPack,
+  onOpenPack,
+  onRemovePack,
+  onUpdateTitle,
+  onOpenStudio,
+  onOpenPacks,
+  onOpenProfile,
+  onHome,
+  onStartGenerate,
+  createSheetRequestId = 0,
+  appLanguage,
+  onChangeLanguage,
+  pendingGeneration,
+  onDismissPending,
+  user,
+  onLogout,
+}) {
   const appText = getAppUiText(appLanguage);
-  const [isCreateSheetOpen, setIsCreateSheetOpen] = useState(false);
+  const insets = useSafeAreaInsets();
   const [isProfileMenuOpen, setIsProfileMenuOpen] = useState(false);
-  const [editingPackId, setEditingPackId] = useState(null);
-  const [editTitle, setEditTitle] = useState("");
-  const [selectedPackFormat, setSelectedPackFormat] = useState("shorts");
-  const pendingModeRef = useRef(null);
+  const handledCreateSheetRequestRef = useRef(createSheetRequestId);
 
-  function handleOpenCreateMode(mode, packFormat = selectedPackFormat) {
-    const nextPackFormat = normalizeRequestedPackFormat(packFormat);
+  useEffect(() => {
+    if (!createSheetRequestId || handledCreateSheetRequestRef.current === createSheetRequestId) {
+      return;
+    }
+
+    handledCreateSheetRequestRef.current = createSheetRequestId;
     setIsProfileMenuOpen(false);
-    if (mode === "file") {
-      pendingModeRef.current = { mode: "file", packFormat: nextPackFormat };
-      setIsCreateSheetOpen(false);
-      return;
-    }
-    setIsCreateSheetOpen(false);
-    onOpenStudio(mode, null, nextPackFormat);
-  }
-
-  async function handleSheetDismiss() {
-    if (pendingModeRef.current?.mode !== "file") {
-      return;
-    }
-    const nextPackFormat = pendingModeRef.current.packFormat || "shorts";
-    pendingModeRef.current = null;
-
-    try {
-      const result = await DocumentPicker.getDocumentAsync({
-        type: ["*/*"],
-        copyToCacheDirectory: true,
-        multiple: false,
-        base64: false,
-      });
-      if (!result.canceled && result.assets?.[0]) {
-        onOpenStudio("file", result.assets[0], nextPackFormat);
-      }
-    } catch {
-      // ignore
-    }
-  }
+    onOpenStudio("default", null, "shorts");
+  }, [createSheetRequestId]);
 
   return (
     <View style={styles.safeArea}>
       <StatusBar style="dark" />
-      <SafeAreaView style={{ flex: 0 }} />
       <View style={styles.screenFill}>
-        <ScrollView contentContainerStyle={styles.homeScreenContent} showsVerticalScrollIndicator={false}>
-          <View style={styles.homeTopBar}>
-            <Text style={styles.homeAppName}>{APP_DISPLAY_NAME}</Text>
-            <Pressable
-              accessibilityRole="button"
-              onPress={() => setIsProfileMenuOpen((current) => !current)}
-            >
-              {user?.user_metadata?.avatar_url ? (
-                <Image source={{ uri: user.user_metadata.avatar_url }} style={styles.homeProfileAvatar} />
-              ) : (
-                <View style={[styles.homeProfileAvatar, { backgroundColor: palette.line, alignItems: "center", justifyContent: "center" }]}>
-                  <Feather color={palette.muted} name="user" size={16} />
-                </View>
-              )}
-            </Pressable>
+        <ScrollView
+          contentContainerStyle={[
+            styles.webHomeScroll,
+            { paddingTop: Math.max(18, insets.top + 10) },
+          ]}
+          showsVerticalScrollIndicator={false}
+        >
+          <View style={styles.webHomeTop}>
+            <WebLogo />
           </View>
+
+          <Pressable
+            accessibilityRole="button"
+            onPress={() => {
+              setIsProfileMenuOpen(false);
+              onOpenStudio("default", null, "shorts");
+            }}
+            style={styles.webHero}
+          >
+            <Text style={styles.webHeroChip}>AI · 학습팩</Text>
+            <Text style={styles.webHeroTitle}>자료를 올리면{"\n"}학습팩으로 바꿔줘요</Text>
+            <Text style={styles.webHeroSub}>쇼츠 학습팩으로 바로 변환</Text>
+            <View style={styles.webHeroButton}>
+              <Text style={styles.webHeroButtonText}>✨ 지금 만들기 →</Text>
+            </View>
+          </Pressable>
 
           {pendingGeneration && (
             <View style={styles.pendingGenCard}>
@@ -2308,6 +2614,9 @@ function HomeScreen({ packs, progressByPack, onOpenPack, onRemovePack, onUpdateT
                   <ActivityIndicator color={palette.accent} size="small" />
                   <View style={{ flex: 1, marginLeft: 10 }}>
                     <Text style={styles.pendingGenTitle}>{appText.generatingPack}</Text>
+                    {pendingGeneration.step ? (
+                      <Text style={styles.pendingGenSubtitle}>{pendingGeneration.step}</Text>
+                    ) : null}
                   </View>
                   <Pressable accessibilityRole="button" onPress={onDismissPending} style={{ marginLeft: 8 }}>
                     <Feather color={palette.muted} name="x" size={18} />
@@ -2331,131 +2640,37 @@ function HomeScreen({ packs, progressByPack, onOpenPack, onRemovePack, onUpdateT
             </View>
           )}
 
-          {packs.map((pack) => {
-            const isReady = pack.status === "ready";
-            const completed = getCompletedIdeaIds(progressByPack, pack.id).length;
-            const isDeletable = true;
-
-            return (
-              <Pressable
-                key={pack.id}
-                accessibilityRole="button"
-                disabled={!isReady}
-                onPress={() => onOpenPack(pack.id)}
-                style={styles.libraryCard}
-              >
-                {isDeletable && (
-                  <Pressable
-                    accessibilityRole="button"
-                    onPress={(e) => {
-                      e.stopPropagation();
-                      Alert.alert(
-                        appText.deletePackConfirmTitle,
-                        appText.deletePackConfirmMessage,
-                        [
-                          { text: appText.deletePackCancel, style: "cancel" },
-                          {
-                            text: appText.deletePackConfirm,
-                            style: "destructive",
-                            onPress: () => onRemovePack(pack.id),
-                          },
-                        ]
-                      );
-                    }}
-                    style={styles.libraryDeleteCorner}
-                  >
-                    <Feather color={palette.muted} name="trash-2" size={14} />
-                  </Pressable>
-                )}
-                <BookCover compact pack={pack} />
-                <View style={styles.libraryText}>
-                  <View style={styles.libraryMetaRow}>
-                    <Text style={styles.libraryCategory}>{pack.category}</Text>
-                    <View style={styles.libraryFormatBadge}>
-                      <Text style={styles.libraryFormatBadgeText}>
-                        {getPackFormat(pack) === "shorts"
-                          ? appText.packFormatShortsChip
-                          : appText.packFormatCardsChip}
-                      </Text>
-                    </View>
-                  </View>
-                  {editingPackId === pack.id ? (
-                    <TextInput
-                      autoFocus
-                      value={editTitle}
-                      onChangeText={setEditTitle}
-                      onBlur={() => {
-                        const trimmed = editTitle.trim();
-                        if (trimmed && trimmed !== pack.title && onUpdateTitle) {
-                          onUpdateTitle(pack.id, trimmed);
-                        }
-                        setEditingPackId(null);
-                      }}
-                      onSubmitEditing={() => {
-                        const trimmed = editTitle.trim();
-                        if (trimmed && trimmed !== pack.title && onUpdateTitle) {
-                          onUpdateTitle(pack.id, trimmed);
-                        }
-                        setEditingPackId(null);
-                      }}
-                      style={[styles.libraryTitle, styles.libraryTitleInput]}
-                      returnKeyType="done"
-                    />
-                  ) : (
-                    <View style={styles.libraryTitleRow}>
-                      <Text numberOfLines={2} style={styles.libraryTitle}>
-                        {getCompactTitle(pack.title)}
-                      </Text>
-                      <Pressable
-                        accessibilityRole="button"
-                        hitSlop={8}
-                        onPress={(e) => {
-                          e.stopPropagation();
-                          setEditTitle(pack.title);
-                          setEditingPackId(pack.id);
-                        }}
-                      >
-                        <Feather color={palette.muted} name="edit-2" size={15} />
-                      </Pressable>
-                    </View>
-                  )}
-                  <Text style={styles.librarySubtitle}>{getPackDisplaySubtitle(pack)}</Text>
-                  {isReady ? (
-                    <View style={styles.libraryProgressBar}>
-                      <View
-                        style={[
-                          styles.libraryProgressFill,
-                          { width: `${pack.ideas.length > 0 ? (completed / pack.ideas.length) * 100 : 0}%` },
-                        ]}
-                      />
-                      <Text style={styles.libraryProgressText}>
-                        {completed}/{pack.ideas.length}
-                      </Text>
-                    </View>
-                  ) : (
-                    <Text style={styles.libraryProgress}>{appText.comingSoon}</Text>
-                  )}
-                </View>
-              </Pressable>
-            );
-          })}
+          <Text style={styles.webSectionLabel}>최근 생성 팩</Text>
+          <View style={styles.webPackList}>
+            {packs.length > 0 ? (
+              packs.map((pack, index) => (
+                <WebPackCard
+                  appText={appText}
+                  index={index}
+                  key={pack.id}
+                  onDelete={() => onRemovePack(pack.id)}
+                  onOpen={() => onOpenPack(pack.id)}
+                  onRename={(title) => onUpdateTitle?.(pack.id, title)}
+                  pack={pack}
+                  progressByPack={progressByPack}
+                />
+              ))
+            ) : (
+              <View style={styles.webEmptyPack}>
+                <Text style={styles.webEmptyTitle}>아직 생성된 팩이 없어요</Text>
+                <Text style={styles.webEmptySub}>학습자료를 올려 첫 쇼츠 팩을 만들어보세요</Text>
+              </View>
+            )}
+          </View>
         </ScrollView>
 
-        <View pointerEvents="box-none" style={styles.homeCreateDockWrap}>
-          <Pressable
-            accessibilityRole="button"
-            onPress={() => {
-              setIsProfileMenuOpen(false);
-              setIsCreateSheetOpen(true);
-            }}
-            style={styles.homeCreateDock}
-          >
-            <View style={styles.homeCreateDockRow}>
-              <MaterialIcons color="#FFFCF8" name="add" size={22} />
-              <Text style={styles.homeCreateDockLabel}>{appText.quickCreateCta}</Text>
-            </View>
-          </Pressable>
-        </View>
+        <WebTabBar
+          active="home"
+          onCreate={() => onOpenStudio("default", null, "shorts")}
+          onHome={onHome}
+          onPacks={onOpenPacks}
+          onProfile={onOpenProfile}
+        />
 
         <ProfileMenu
           appLanguage={appLanguage}
@@ -2467,14 +2682,136 @@ function HomeScreen({ packs, progressByPack, onOpenPack, onRemovePack, onUpdateT
           visible={isProfileMenuOpen}
         />
 
-        <CreatePackSheet
-          appText={appText}
-          onChangePackFormat={setSelectedPackFormat}
-          onClose={() => setIsCreateSheetOpen(false)}
-          onDismiss={handleSheetDismiss}
-          onOpenMode={(mode) => handleOpenCreateMode(mode, selectedPackFormat)}
-          selectedPackFormat={selectedPackFormat}
-          visible={isCreateSheetOpen}
+      </View>
+    </View>
+  );
+}
+
+function PackListScreen({
+  packs,
+  progressByPack,
+  onOpenPack,
+  onRemovePack,
+  onUpdateTitle,
+  onOpenStudio,
+  onOpenHome,
+  onOpenProfile,
+  appLanguage,
+}) {
+  const appText = getAppUiText(appLanguage);
+  const insets = useSafeAreaInsets();
+
+  return (
+    <View style={styles.safeArea}>
+      <StatusBar style="dark" />
+      <View style={styles.screenFill}>
+        <ScrollView
+          contentContainerStyle={[
+            styles.webPacksScroll,
+            { paddingTop: Math.max(56, insets.top + 28) },
+          ]}
+          showsVerticalScrollIndicator={false}
+        >
+          <Text style={styles.webPacksTitle}>내 팩</Text>
+          <Text style={styles.webPacksSub}>생성된 학습 쇼츠 팩 목록</Text>
+
+          {packs.length > 0 ? (
+            <>
+              <Text style={styles.webSectionLabel}>저장된 생성 팩</Text>
+              <View style={styles.webPackList}>
+                {packs.map((pack, index) => (
+                  <WebPackCard
+                    appText={appText}
+                    index={index}
+                    key={pack.id}
+                    onDelete={() => onRemovePack(pack.id)}
+                    onOpen={() => onOpenPack(pack.id)}
+                    onRename={(title) => onUpdateTitle?.(pack.id, title)}
+                    pack={pack}
+                    progressByPack={progressByPack}
+                  />
+                ))}
+              </View>
+            </>
+          ) : (
+            <View style={styles.webPacksEmpty}>
+              <Text style={styles.webPacksEmptyIcon}>📚</Text>
+              <Text style={styles.webEmptyTitle}>아직 생성된 팩이 없어요</Text>
+              <Pressable accessibilityRole="button" onPress={onOpenStudio} style={styles.webEmptyButton}>
+                <Text style={styles.webEmptyButtonText}>새 쇼츠 만들기</Text>
+              </Pressable>
+            </View>
+          )}
+        </ScrollView>
+        <WebTabBar
+          active="packs"
+          onCreate={onOpenStudio}
+          onHome={onOpenHome}
+          onPacks={() => {}}
+          onProfile={onOpenProfile}
+        />
+      </View>
+    </View>
+  );
+}
+
+function WebProfileScreen({ appLanguage, onOpenHome, onOpenStudio, onOpenPacks, onLogout, packs, progressByPack, user }) {
+  const appText = getAppUiText(appLanguage);
+  const insets = useSafeAreaInsets();
+  const packCount = packs.length;
+  const completedCount = packs.filter((pack) => getCompletedIdeaIds(progressByPack, pack.id).length >= (pack.ideas?.length || 1)).length;
+  const displayName = user?.user_metadata?.full_name || user?.email || "Yoon";
+  const email = user?.email || "dev@local";
+
+  return (
+    <View style={styles.safeArea}>
+      <StatusBar style="dark" />
+      <View style={styles.screenFill}>
+        <ScrollView
+          contentContainerStyle={[
+            styles.webPacksScroll,
+            { paddingTop: Math.max(56, insets.top + 28) },
+          ]}
+          showsVerticalScrollIndicator={false}
+        >
+          <View style={styles.webProfileHero}>
+            <View style={styles.webProfileAvatar}>
+              <Text style={styles.webProfileAvatarText}>Y</Text>
+            </View>
+            <Text numberOfLines={1} style={styles.webProfileName}>{displayName}</Text>
+            <Text numberOfLines={1} style={styles.webProfileEmail}>{email}</Text>
+            <View style={styles.webProfileBadge}>
+              <Text style={styles.webProfileBadgeText}>SnapMind Learner</Text>
+            </View>
+          </View>
+          <View style={styles.webProfileStats}>
+            <View style={styles.webProfileStatBox}>
+              <Text style={styles.webProfileStatNumber}>{packCount}</Text>
+              <Text style={styles.webProfileStatLabel}>생성 팩</Text>
+            </View>
+            <View style={styles.webProfileStatBox}>
+              <Text style={styles.webProfileStatNumber}>{completedCount}</Text>
+              <Text style={styles.webProfileStatLabel}>완료 팩</Text>
+            </View>
+          </View>
+          <Text style={styles.webSectionLabel}>계정</Text>
+          <View style={styles.webProfileList}>
+            <View style={styles.webProfileItem}>
+              <Text style={styles.webProfileItemText}>언어</Text>
+              <Text style={styles.webProfileItemRight}>{appLanguage === "ko" ? "한국어" : "English"} ›</Text>
+            </View>
+            <Pressable accessibilityRole="button" onPress={onLogout} style={styles.webProfileItem}>
+              <Text style={styles.webProfileItemText}>로그아웃</Text>
+              <Text style={styles.webProfileItemRight}>›</Text>
+            </Pressable>
+          </View>
+        </ScrollView>
+        <WebTabBar
+          active="profile"
+          onCreate={onOpenStudio}
+          onHome={onOpenHome}
+          onPacks={onOpenPacks}
+          onProfile={() => {}}
         />
       </View>
     </View>
@@ -2492,6 +2829,7 @@ function StudioScreen({
 }) {
   const appText = getAppUiText(appLanguage);
   const requestedPackFormat = normalizeRequestedPackFormat(packFormat);
+  const insets = useSafeAreaInsets();
   const [title, setTitle] = useState(DEFAULT_STUDIO_TITLE);
   const [sourceFile, setSourceFile] = useState(null);
   const [sourceText, setSourceText] = useState("");
@@ -2678,6 +3016,13 @@ function StudioScreen({
     });
   }
 
+  const generateButtonLabel =
+    requestedPackFormat === "cards"
+      ? "✨ AI로 카드팩 생성하기"
+      : requestedPackFormat === "deck"
+        ? "✨ AI로 덱 생성하기"
+        : "✨ AI로 쇼츠 생성하기";
+
   if (entryMode === "text") {
     return (
       <SafeAreaView style={styles.safeArea}>
@@ -2767,12 +3112,13 @@ function StudioScreen({
                 <Text style={styles.studioFormatInlineBadgeText}>
                   {requestedPackFormat === "shorts"
                     ? appText.packFormatShortsChip
-                    : appText.packFormatCardsChip}
+                    : requestedPackFormat === "deck"
+                      ? appText.packFormatDeckChip
+                      : appText.packFormatCardsChip}
                 </Text>
               </View>
               <Text style={styles.pasteScreenTitle}>{appText.quickCreateFileTitle}</Text>
               <Text style={[styles.pasteScreenBody, { marginBottom: 8 }]}>{appText.quickCreateFileBody}</Text>
-              <Text style={[styles.pasteScreenBody, { marginBottom: 24, fontSize: 12, color: palette.muted }]}>{appText.ocrLanguageHint}</Text>
               <SurfaceButton label={appText.chooseSourceDocument} icon="upload-file" onPress={handlePickSourceFile} />
               {error ? (
                 <View style={[styles.errorCard, { marginTop: 16, width: "100%" }]}>
@@ -2788,205 +3134,374 @@ function StudioScreen({
   }
 
   return (
-    <SafeAreaView style={styles.safeArea}>
+    <SafeAreaView style={styles.webInputSafeArea}>
       <StatusBar style="dark" />
-      <ScrollView contentContainerStyle={styles.screenContent} showsVerticalScrollIndicator={false}>
-        <View style={styles.topBar}>
-          <Pressable accessibilityRole="button" onPress={onBack} style={styles.roundButton}>
-            <Feather color={palette.ink} name="chevron-left" size={24} />
+      <View style={styles.webInputScreen}>
+        <ScrollView
+          contentContainerStyle={[
+            styles.webInputScroll,
+            { paddingTop: Math.max(24, insets.top + 8), paddingBottom: 134 + insets.bottom },
+          ]}
+          keyboardShouldPersistTaps="handled"
+          showsVerticalScrollIndicator={false}
+        >
+          <Pressable accessibilityRole="button" onPress={onBack} style={styles.webInputBackButton}>
+            <Text style={styles.webInputBackText}>← 뒤로</Text>
           </Pressable>
-          <View style={styles.topBarTitleWrap}>
-            <Text style={styles.topBarTitle}>{appText.studioTopTitle}</Text>
-          </View>
-          <View style={styles.topBarSpacer} />
-        </View>
+          <Text style={styles.webInputTitle}>쇼츠 만들기</Text>
+          <Text style={styles.webInputSubtitle}>학습 자료를 붙여넣거나 파일을 올려주세요</Text>
 
-        <SectionHeader title={appText.studioTopTitle} body={appText.quickCreateBody} />
-
-        <PackFormatPicker
-          appText={appText}
-          onChange={onChangePackFormat}
-          selectedPackFormat={requestedPackFormat}
-        />
-
-        <View style={styles.formGroup}>
-          <View style={styles.formLabelRow}>
-            <Text style={styles.inputLabel}>{appText.sourceText}</Text>
-            {sourceText.trim() ? <Text style={styles.fileReadyBadge}>{appText.ready}</Text> : null}
-          </View>
+          <Text style={styles.webInputLabel}>원문 텍스트</Text>
           <TextInput
             multiline
             onChangeText={handleChangeSourceText}
-            placeholder={appText.sourceTextPlaceholder}
+            placeholder="원문 텍스트를 여기에 붙여넣어 주세요"
             placeholderTextColor={withAlpha(palette.muted, "A0")}
             ref={sourceTextInputRef}
-            style={[styles.input, styles.inputMultiline]}
+            scrollEnabled
+            style={styles.webInputTextArea}
             textAlignVertical="top"
             value={sourceText}
           />
-          <Text style={styles.fieldHint}>{appText.sourceTextHint()}</Text>
-        </View>
+
+          <View style={styles.webInputUploadRow}>
+            <Pressable
+              accessibilityRole="button"
+              disabled={isPickingSourceFile}
+              onPress={handlePickSourceFile}
+              style={styles.webInputUploadBox}
+            >
+              <Text style={styles.webInputUploadIcon}>{isPickingSourceFile ? "⏳" : "📎"}</Text>
+              <Text style={styles.webInputUploadTitle}>
+                {isPickingSourceFile ? "읽는 중..." : sourceFile ? "파일 선택됨" : "파일 업로드"}
+              </Text>
+              <Text numberOfLines={1} style={styles.webInputUploadDesc}>
+                {sourceFile?.name || "PDF, DOCX, HWP, TXT"}
+              </Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => Alert.alert("준비 중", "사진 촬영은 다음 버전에서 연결할게요. 지금은 파일 업로드나 텍스트 붙여넣기를 사용해 주세요.")}
+              style={styles.webInputUploadBox}
+            >
+              <Text style={styles.webInputUploadIcon}>📷</Text>
+              <Text style={styles.webInputUploadTitle}>사진 촬영</Text>
+              <Text style={styles.webInputUploadDesc}>교재, 노트</Text>
+            </Pressable>
+          </View>
 
         {error ? (
-          <View style={styles.errorCard}>
-            <Text style={styles.errorTitle}>{appText.couldNotGeneratePack}</Text>
-            <Text style={styles.errorBody}>{error}</Text>
+          <View style={styles.webInputError}>
+            <Text style={styles.webInputErrorText}>⚠️ {error}</Text>
           </View>
         ) : null}
 
-        <Text style={styles.longContentWarning}>{appText.longContentWarning}</Text>
+          <Text style={styles.webInputLabel}>결과 형식</Text>
+          <View style={styles.webInputFormatRow}>
+            {WEB_STUDIO_FORMATS.map((format) => {
+              const isActive = requestedPackFormat === format.id;
+              return (
+                <Pressable
+                  accessibilityRole="button"
+                  key={format.id}
+                  onPress={() => onChangePackFormat(format.id)}
+                  style={[styles.webInputFormatCard, isActive && styles.webInputFormatCardActive]}
+                >
+                  <Text style={styles.webInputFormatIcon}>{format.icon}</Text>
+                  <Text style={[styles.webInputFormatName, isActive && styles.webInputFormatNameActive]}>
+                    {format.name}
+                  </Text>
+                  <Text style={styles.webInputFormatDesc}>{format.desc}</Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        </ScrollView>
 
-        <SurfaceButton
-          disabled={!sourceFile && !sourceText.trim()}
-          icon="auto-awesome"
-          label={loading ? appText.generatingPack : appText.generatePack}
-          loading={loading}
-          onPress={handleGenerate}
-        />
-      </ScrollView>
+        <View style={[styles.webInputFooter, { paddingBottom: Math.max(18, insets.bottom + 10) }]}>
+          <Pressable
+            accessibilityRole="button"
+            disabled={!sourceFile && !sourceText.trim()}
+            onPress={() => handleGenerate()}
+            style={[
+              styles.webInputGenerateButton,
+              (!sourceFile && !sourceText.trim()) && styles.webInputGenerateButtonDisabled,
+            ]}
+          >
+            <Text style={styles.webInputGenerateButtonText}>{generateButtonLabel}</Text>
+          </Pressable>
+        </View>
+      </View>
     </SafeAreaView>
   );
 }
 
-function DetailScreen({ pack, progressByPack, onBack, onStartIdea, onStartPackReview, onUpdateTitle, appLanguage }) {
-  const completedIdeaIds = getCompletedIdeaIds(progressByPack, pack.id);
-  const nextIdea = getNextIdea(pack, completedIdeaIds) || null;
-  const hasPackReview = getPackReviewQuestions(pack).length > 0;
-  const packReviewCompleted = hasPackReviewCompleted(progressByPack, pack.id);
-  const uiText = getPackUiText(pack, appLanguage);
-  const appText = getAppUiText(appLanguage);
-  const isFirstIdea = completedIdeaIds.length === 0;
-  const [isEditingTitle, setIsEditingTitle] = useState(false);
-  const [editTitle, setEditTitle] = useState(pack.title);
-  const detailCtaTitle = nextIdea
-    ? getCompactTitle(nextIdea.title)
-    : hasPackReview && !packReviewCompleted
-      ? uiText.finalReviewReady
-      : null;
-  const detailCtaAction = nextIdea
-    ? (isFirstIdea ? uiText.startReading : uiText.continueReading)
-    : hasPackReview && !packReviewCompleted
-      ? uiText.reviewPack
-      : null;
+function DetailScreen({
+  pack,
+  progressByPack,
+  onBack,
+  onStartIdea,
+  onOpenStudio,
+  onOpenHome,
+  onOpenPacks,
+  onOpenProfile,
+  appLanguage,
+}) {
+  const sections = getPackTocSections(pack);
+  const totalShorts = pack.ideas?.length || 0;
+  const detailCount = sections.reduce((sum, section) => sum + section.ideas.length, 0);
+  const insets = useSafeAreaInsets();
 
   return (
     <View style={styles.safeArea}>
       <StatusBar style="dark" />
-      <SafeAreaView style={{ flex: 0 }} />
-      <ScrollView contentContainerStyle={[styles.detailScreenContent, (nextIdea || (hasPackReview && !packReviewCompleted)) && { paddingBottom: 140 }]} showsVerticalScrollIndicator={false}>
-        <View style={styles.topBar}>
-          <Pressable accessibilityRole="button" onPress={onBack} style={styles.roundButton}>
-            <Feather color={palette.ink} name="chevron-left" size={24} />
+      <View style={styles.screenFill}>
+        <ScrollView
+          contentContainerStyle={[
+            styles.webTocScroll,
+            { paddingTop: Math.max(24, insets.top + 12) },
+          ]}
+          showsVerticalScrollIndicator={false}
+        >
+          <Pressable accessibilityRole="button" onPress={onBack} style={styles.webBackButton}>
+            <Text style={styles.webBackButtonText}>← 팩 목록</Text>
           </Pressable>
-          <Pressable style={styles.topBarTitleWrap} onPress={() => { setEditTitle(pack.title); setIsEditingTitle(true); }}>
-            {isEditingTitle ? (
-              <TextInput
-                autoFocus
-                value={editTitle}
-                onChangeText={setEditTitle}
-                onBlur={() => {
-                  const trimmed = editTitle.trim();
-                  if (trimmed && trimmed !== pack.title && onUpdateTitle) {
-                    onUpdateTitle(trimmed);
-                  }
-                  setIsEditingTitle(false);
-                }}
-                onSubmitEditing={() => {
-                  const trimmed = editTitle.trim();
-                  if (trimmed && trimmed !== pack.title && onUpdateTitle) {
-                    onUpdateTitle(trimmed);
-                  }
-                  setIsEditingTitle(false);
-                }}
-                style={[styles.topBarTitle, styles.topBarTitleInput]}
-                returnKeyType="done"
-              />
-            ) : (
-              <Text numberOfLines={2} style={styles.topBarTitle}>
-                {getCompactTitle(pack.title)}
-              </Text>
-            )}
-            <Text style={styles.topBarCaption}>{pack.category}</Text>
-          </Pressable>
-          <View style={styles.topBarSpacer} />
-        </View>
-
-        <View style={styles.heroCard}>
-          <BookCover pack={pack} />
-
-          <View style={styles.progressBarWrapper}>
-            <View style={styles.progressBar}>
-              <View
-                style={[
-                  styles.progressFill,
-                  {
-                    width: `${(completedIdeaIds.length / pack.ideas.length) * 100}%`,
-                  },
-                ]}
-              />
-              <Text style={styles.progressText}>
-                {completedIdeaIds.length}/{pack.ideas.length}
-              </Text>
-            </View>
-          </View>
-
-          <Text style={styles.heroTitle}>{getPackDisplaySubtitle(pack)}</Text>
-          <Text style={styles.heroDescription}>{pack.description}</Text>
-
-        </View>
-
-        {pack.ideas.map((idea, index) => {
-          let state = "locked";
-          if (completedIdeaIds.includes(idea.id)) {
-            state = "completed";
-          } else if (isIdeaUnlocked(index, completedIdeaIds)) {
-            state = "unlocked";
-          }
-
-          const prevSection = index > 0 ? pack.ideas[index - 1].section : null;
-          const showSectionHeader = idea.section && idea.section !== prevSection;
-
-          return (
-            <React.Fragment key={`${idea.id}-${index}`}>
-              {showSectionHeader && (
-                <View style={styles.ideaSectionHeader}>
-                  <View style={styles.ideaSectionLine} />
-                  <Text style={styles.ideaSectionLabel}>{idea.section}</Text>
+          <Text style={styles.webTocKicker}>학습 목차</Text>
+          <Text style={styles.webTocTitle}>{pack.title || "생성된 쇼츠 팩"}</Text>
+          <Text style={styles.webTocSub}>
+            {totalShorts}개 쇼츠 · {sections.length}개 대단원 · {detailCount}개 세부 목차
+          </Text>
+          <View style={styles.webTocList}>
+            {sections.map((section, sectionIndex) => (
+              <View key={section.id} style={styles.webTocGroup}>
+                <View style={styles.webTocGroupHead}>
+                  <View style={[styles.webTocNum, styles.webTocNumMajor]}>
+                    <Text style={[styles.webTocNumText, styles.webTocNumTextMajor]}>
+                      {section.number || String(sectionIndex + 1).padStart(2, "0")}
+                    </Text>
+                  </View>
+                  <View style={styles.webTocBody}>
+                    <Text numberOfLines={2} style={styles.webTocGroupTitle}>
+                      {section.title}
+                    </Text>
+                    <Text style={styles.webTocSummary}>
+                      {section.ideas.length}개 세부 목차 · {section.ideas.length}개 쇼츠
+                    </Text>
+                  </View>
                 </View>
-              )}
-              <IdeaRow
-                idea={idea}
-                onPress={() => onStartIdea(pack.id, idea.id)}
-                state={state}
+                {section.ideas.map((idea, ideaIndex) => (
+                  <Pressable
+                    accessibilityRole="button"
+                    key={idea.id}
+                    onPress={() => onStartIdea(pack.id, idea.id)}
+                    style={styles.webTocChild}
+                  >
+                    <View style={styles.webTocChildNum}>
+                      <Text style={styles.webTocChildNumText}>{`${sectionIndex + 1}.${ideaIndex + 1}`}</Text>
+                    </View>
+                    <View style={styles.webTocBody}>
+                      <Text numberOfLines={1} style={styles.webTocItemTitle}>
+                        {idea.title}
+                      </Text>
+                      <Text style={styles.webTocSummary}>1개 쇼츠</Text>
+                    </View>
+                    <View style={styles.webTocCount}>
+                      <Text style={styles.webTocCountText}>1</Text>
+                    </View>
+                  </Pressable>
+                ))}
+              </View>
+            ))}
+          </View>
+        </ScrollView>
+        <WebTabBar
+          active="packs"
+          onCreate={onOpenStudio}
+          onHome={onOpenHome}
+          onPacks={onOpenPacks}
+          onProfile={onOpenProfile}
+        />
+      </View>
+    </View>
+  );
+}
+
+function DeckDiagramPreview({ slide }) {
+  const diagram = slide?.diagram || {};
+  const nodes = Array.isArray(diagram.nodes) ? diagram.nodes.slice(0, 8) : [];
+  const steps = Array.isArray(diagram.steps) ? diagram.steps.slice(0, 6) : [];
+  const rows = Array.isArray(diagram.rows) ? diagram.rows.slice(0, 5) : [];
+
+  if (slide?.layout === "comparison_matrix" && rows.length > 0) {
+    return (
+      <View style={styles.deckMatrix}>
+        {rows.map((row, index) => (
+          <View key={`row-${index}`} style={styles.deckMatrixRow}>
+            <Text style={styles.deckMatrixLabel} numberOfLines={2}>{row.label}</Text>
+            <Text style={styles.deckMatrixCell} numberOfLines={3}>{row.left}</Text>
+            <Text style={styles.deckMatrixCell} numberOfLines={3}>{row.right}</Text>
+          </View>
+        ))}
+      </View>
+    );
+  }
+
+  if ((slide?.layout === "process_pipeline" || slide?.layout === "data_story") && steps.length > 0) {
+    return (
+      <View style={styles.deckPipeline}>
+        {steps.map((step, index) => (
+          <React.Fragment key={`step-${index}`}>
+            <View style={styles.deckStep}>
+              <Text style={styles.deckStepLabel} numberOfLines={1}>{step.label}</Text>
+              <Text style={styles.deckStepDetail} numberOfLines={3}>{step.detail}</Text>
+            </View>
+            {index < steps.length - 1 ? <MaterialIcons color="#1B4965" name="arrow-forward" size={22} /> : null}
+          </React.Fragment>
+        ))}
+      </View>
+    );
+  }
+
+  if (nodes.length > 0) {
+    return (
+      <View style={styles.deckNodeMap}>
+        {nodes.map((node, index) => (
+          <View
+            key={node.id || `node-${index}`}
+            style={[
+              styles.deckNode,
+              index === 0 && styles.deckNodePrimary,
+              slide?.layout === "layered_model" && { width: `${Math.max(48, 86 - index * 7)}%` },
+            ]}
+          >
+            <Text style={styles.deckNodeLabel} numberOfLines={1}>{node.label}</Text>
+            {node.role ? <Text style={styles.deckNodeRole} numberOfLines={2}>{node.role}</Text> : null}
+          </View>
+        ))}
+      </View>
+    );
+  }
+
+  return null;
+}
+
+function DeckLessonScreen({ pack, idea, onClose, onFinish, appLanguage }) {
+  const slide = getDeckSlideForIdea(pack, idea);
+  const uiText = getLessonUiText(pack, idea, appLanguage);
+  const textBlocks = Array.isArray(slide?.textBlocks) ? slide.textBlocks : [];
+  const bodyBlocks = textBlocks.filter((block) => !["headline", "kicker"].includes(block.role)).slice(0, 5);
+  const visual = getDeckSlideVisual(slide);
+  const [slideImageUrl, setSlideImageUrl] = useState("");
+
+  useEffect(() => {
+    let isMounted = true;
+    setSlideImageUrl("");
+
+    if (visual?.imageStatus !== "ready" || !visual?.imagePath) {
+      return () => {
+        isMounted = false;
+      };
+    }
+
+    fetch(`${API_BASE_URL}/api/media/sign`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        path: visual.imagePath,
+        bucketName: visual.bucketName,
+      }),
+    })
+      .then(async (response) => {
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data?.signedUrl) {
+          throw new Error(data.error || "Failed to load deck image.");
+        }
+        if (isMounted) {
+          setSlideImageUrl(data.signedUrl);
+        }
+      })
+      .catch(() => {
+        if (isMounted) {
+          setSlideImageUrl("");
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [slide?.id, visual?.imagePath, visual?.imageStatus, visual?.bucketName]);
+
+  return (
+    <SafeAreaView style={styles.deckLessonSafeArea}>
+      <StatusBar style="dark" />
+      <View style={styles.deckLessonTopBar}>
+        <Pressable accessibilityRole="button" onPress={onClose} style={styles.roundButton}>
+          <Feather color={palette.ink} name="chevron-left" size={24} />
+        </Pressable>
+        <Text style={styles.deckLessonTopTitle} numberOfLines={1}>{pack.title}</Text>
+        <View style={styles.roundButtonPlaceholder} />
+      </View>
+
+      <ScrollView contentContainerStyle={styles.deckLessonContent} showsVerticalScrollIndicator={false}>
+        <View style={styles.deckSlideFrame}>
+          {slideImageUrl ? (
+            <>
+              <Image
+                resizeMode="cover"
+                source={{ uri: slideImageUrl }}
+                style={styles.deckSlideVisualImage}
               />
-            </React.Fragment>
-          );
-        })}
+              <View style={styles.deckSlideVisualWash} />
+            </>
+          ) : null}
+          <View style={styles.deckBlueprintGrid} pointerEvents="none" />
+          <View style={styles.deckSlideHeader}>
+            <Text style={styles.deckSlideSection} numberOfLines={1}>
+              {slide?.section || pack.category || "DECK"}
+            </Text>
+            <Text style={styles.deckSlideNumber}>{slide?.order || 1}</Text>
+          </View>
+          <Text style={styles.deckSlideTitle} numberOfLines={3} adjustsFontSizeToFit minimumFontScale={0.72}>
+            {slide?.title || idea?.title}
+          </Text>
+          <Text style={styles.deckSlideThesis} numberOfLines={3}>
+            {slide?.thesis || idea?.teaser}
+          </Text>
+          <DeckDiagramPreview slide={slide} />
+          {bodyBlocks.length > 0 ? (
+            <View style={styles.deckTextBlockGrid}>
+              {bodyBlocks.map((block, index) => (
+                <View key={`block-${index}`} style={styles.deckTextBlock}>
+                  {block.emphasis ? (
+                    <Text style={styles.deckTextBlockKicker} numberOfLines={1}>{block.emphasis}</Text>
+                  ) : null}
+                  <Text style={styles.deckTextBlockText} numberOfLines={4}>{block.text}</Text>
+                </View>
+              ))}
+            </View>
+          ) : null}
+        </View>
+
+        {slide?.visualMetaphor ? (
+          <View style={styles.deckNotesCard}>
+            <Text style={styles.deckNotesKicker}>VISUAL PLAN</Text>
+            <Text style={styles.deckNotesText}>{slide.visualMetaphor}</Text>
+          </View>
+        ) : null}
+        {slide?.speakerNotes ? (
+          <View style={styles.deckNotesCard}>
+            <Text style={styles.deckNotesKicker}>NOTES</Text>
+            <Text style={styles.deckNotesText}>{slide.speakerNotes}</Text>
+          </View>
+        ) : null}
       </ScrollView>
 
-      {(nextIdea || (hasPackReview && !packReviewCompleted)) ? (
-        <View style={styles.detailCtaWrapper}>
-          <Text numberOfLines={1} style={styles.detailCtaTopTitle}>
-            {detailCtaTitle}
-          </Text>
-          <Pressable
-            accessibilityRole="button"
-            onPress={() => {
-              if (nextIdea) {
-                onStartIdea(pack.id, nextIdea.id);
-              } else if (hasPackReview && !packReviewCompleted) {
-                onStartPackReview(pack.id);
-              }
-            }}
-            style={styles.detailCtaButton}
-          >
-            <Text numberOfLines={1} style={styles.detailCtaButtonLabel}>
-              {detailCtaAction}
-            </Text>
-          </Pressable>
-        </View>
-      ) : null}
-    </View>
+      <View style={styles.deckLessonFooter}>
+        <SurfaceButton label={uiText.finishIdea} icon="check" onPress={onFinish} />
+      </View>
+    </SafeAreaView>
   );
 }
 
@@ -2996,18 +3511,31 @@ function ShortsLessonScreen({
   chatMessages = [],
   onClose,
   onFinish,
+  onIdeaWatched = () => {},
+  onNavigateShort = () => {},
   onUpdateChat = () => {},
   appLanguage,
 }) {
   const { height: windowHeight } = useWindowDimensions();
   const clips = Array.isArray(idea?.clips) && idea.clips.length > 0 ? idea.clips : null;
   const totalClips = clips ? clips.length : 1;
+  // 목차 칩(대단원/소단원) & 진행(몇 번째 쇼츠) 표시용
+  const ideaList = Array.isArray(pack?.ideas) ? pack.ideas : [];
+  const ideaIndex = Math.max(0, ideaList.findIndex((it) => it?.id === idea?.id));
+  const totalIdeas = ideaList.length || 1;
+  const isLastIdea = ideaIndex >= totalIdeas - 1;
+  const chapterLabel = String(idea?.section || "").trim();
+  const subsectionLabel = String(idea?.title || "").trim();
   const [clipIndex, setClipIndex] = useState(0);
   const short = clips ? clips[clipIndex] || clips[0] : getIdeaShort(idea);
   const shortVideo = getShortVideo(short);
   const uiText = getLessonUiText(pack, idea, appLanguage);
   const scenes = Array.isArray(short?.scenes) ? short.scenes : [];
-  const quizQuestions = useMemo(() => getPracticeQuestions(idea), [idea?.id]);
+  // 퀴즈는 전체 쇼츠를 다 본 뒤 마지막 idea에서만 전체 문제를 합쳐서 한 번에 보여준다.
+  const quizQuestions = useMemo(
+    () => (isLastIdea ? getAllPackQuestions(pack) : []),
+    [isLastIdea, pack]
+  );
   const ideaContext = useMemo(() => buildIdeaContext(pack, idea), [pack, idea]);
   const [audioUrl, setAudioUrl] = useState("");
   const [audioError, setAudioError] = useState("");
@@ -3017,10 +3545,13 @@ function ShortsLessonScreen({
   const [isFetchingVideo, setIsFetchingVideo] = useState(false);
   const [videoStatus, setVideoStatus] = useState(null);
   const [sceneImageUrlsById, setSceneImageUrlsById] = useState({});
+  // 서명 URL이 나왔다는 것과 실제 이미지 파일 다운로드가 끝났다는 건 다르므로 별도로 추적
+  const [prefetchedSceneIds, setPrefetchedSceneIds] = useState({});
   const [isQuizUnlocked, setIsQuizUnlocked] = useState(false);
   const [isQuizMode, setIsQuizMode] = useState(false);
   const [isClipFinished, setIsClipFinished] = useState(false);
-  const [isSubtitleEnabled, setIsSubtitleEnabled] = useState(false);
+  const [isSubtitleEnabled, setIsSubtitleEnabled] = useState(true);
+  const [playbackRate, setPlaybackRate] = useState(1);
   const [scrubPreviewMs, setScrubPreviewMs] = useState(null);
   const [selectedAnswersByQuestion, setSelectedAnswersByQuestion] = useState({});
   const [questionIndex, setQuestionIndex] = useState(0);
@@ -3033,16 +3564,37 @@ function ShortsLessonScreen({
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const hasAutoplayAttemptedRef = useRef(false);
   const wasPlayingBeforeScrubRef = useRef(false);
+  const hasMarkedWatchedRef = useRef(false);
+  const autoAdvanceToQuizTimerRef = useRef(null);
+  const swipeHintBounceAnim = useRef(new Animated.Value(0)).current;
   const videoRef = useRef(null);
   const chatScrollRef = useRef(null);
   const chatRequestTokenRef = useRef(0);
   const chatTypingTimerRef = useRef(null);
   const player = useAudioPlayer(audioUrl ? { uri: audioUrl } : null, {
     updateInterval: 100,
-    keepAudioSessionActive: true,
+    keepAudioSessionActive: false,
   });
   const status = useAudioPlayerStatus(player);
-  const audioSegments = useMemo(() => getShortAudioSegments(short), [idea?.id, clipIndex, short?.tts?.audioPath]);
+  useEffect(() => {
+    if (!player) return;
+    try {
+      player.setPlaybackRate(playbackRate, "high");
+    } catch (_) {
+      try { player.playbackRate = playbackRate; } catch (__) {}
+    }
+  }, [player, playbackRate, audioUrl]);
+  // 화면 벗어날 때(언마운트) 오디오 확실히 정지 → 나가도 소리 남거나 재진입 중복 방지
+  useEffect(() => {
+    return () => {
+      try { player.pause(); } catch (_) {}
+      try { player.remove?.(); } catch (_) {}
+    };
+  }, [player]);
+  const audioSegments = useMemo(
+    () => getShortAudioSegments(short),
+    [idea?.id, clipIndex, short?.tts?.audioPath, short?.tts?.durationMs, short?.tts?.segments?.length]
+  );
   const hasBundledVideo = typeof shortVideo?.localAsset === "number";
   const resolvedVideoSource = hasBundledVideo ? shortVideo.localAsset : videoUrl ? { uri: videoUrl } : null;
   const hasPlayableVideo = Boolean(resolvedVideoSource);
@@ -3055,28 +3607,61 @@ function ShortsLessonScreen({
     : status?.duration || (short?.tts?.durationMs || 0) / 1000;
   const effectivePlaybackTimeMs =
     scrubPreviewMs !== null ? Math.max(0, Number(scrubPreviewMs || 0)) : Math.max(0, Math.round(playbackCurrentTimeSec * 1000) - videoStartOffsetMs);
+  // TTS 세그먼트(추정 ms)를 실제 오디오 길이에 맞춰 재스케일 → 자막/이미지 싱크 드리프트 제거
+  const realDurationMs = Math.max(0, Math.round(Number(playbackDurationSec || 0) * 1000));
+  const scaledSegments = useMemo(() => {
+    if (!audioSegments.length) return audioSegments;
+    const estTotal = Math.max(
+      1,
+      Number(audioSegments[audioSegments.length - 1]?.endMs || short?.tts?.durationMs || 0)
+    );
+    const scale = realDurationMs > 500 && estTotal > 0 ? realDurationMs / estTotal : 1;
+    if (Math.abs(scale - 1) < 0.02) return audioSegments;
+    return audioSegments.map((seg) => ({
+      ...seg,
+      startMs: Math.round(seg.startMs * scale),
+      endMs: Math.round(seg.endMs * scale),
+    }));
+  }, [audioSegments, realDurationMs, short?.tts?.durationMs]);
+  const scaledShort = useMemo(
+    () => (short ? { ...short, tts: { ...(short.tts || {}), segments: scaledSegments } } : short),
+    [short, scaledSegments]
+  );
   const activeSceneIndex = useMemo(
-    () => getShortSceneActiveIndex(short, effectivePlaybackTimeMs / 1000),
-    [effectivePlaybackTimeMs, short]
+    () => getShortSceneActiveIndex(scaledShort, effectivePlaybackTimeMs / 1000),
+    [effectivePlaybackTimeMs, scaledShort]
   );
   const activeScene = scenes[activeSceneIndex] || scenes[0] || null;
   const activeSceneImageUrl = activeScene?.id ? sceneImageUrlsById[activeScene.id] || "" : "";
+  // 첫 장면 이미지가 있을 예정인데 아직 서명/프리페치가 끝나지 않았으면, 텍스트 폴백을 보여주지 않고 로딩 상태로 대기
+  const firstScene = scenes[0] || null;
+  const isWaitingForFirstImage = Boolean(
+    firstScene?.id &&
+      getShortSceneImage(firstScene)?.imagePath &&
+      !prefetchedSceneIds[firstScene.id]
+  );
   const activeSubtitleSegment = useMemo(
-    () => getShortActiveSegment(audioSegments, effectivePlaybackTimeMs),
-    [audioSegments, effectivePlaybackTimeMs]
+    () => getShortActiveSegment(scaledSegments, effectivePlaybackTimeMs),
+    [scaledSegments, effectivePlaybackTimeMs]
   );
   const displayedSubtitleText = isSubtitleEnabled
     ? getShortSubtitleLine(activeSubtitleSegment, effectivePlaybackTimeMs)
     : "";
-  const clipDurationMs = Math.max(1, Number(shortVideo?.durationMs || short?.tts?.durationMs || 0));
+  const clipDurationMs = Math.max(
+    1,
+    Number(realDurationMs > 500 ? realDurationMs : shortVideo?.durationMs || short?.tts?.durationMs || 0)
+  );
   const clipProgress = clipDurationMs > 0 ? clampNumber(effectivePlaybackTimeMs / clipDurationMs, 0, 1) : 0;
   const displayedProgress =
     scrubPreviewMs !== null
       ? clampNumber(scrubPreviewMs / clipDurationMs, 0, 1)
       : clipProgress;
+  const hasAudioFallback = !hasPlayableVideo && !isFetchingAudio && Boolean(audioError);
   const canGoToPreviousClip = Boolean(clips && clipIndex > 0);
   const canGoToNextClip = Boolean(clips && clipIndex < totalClips - 1);
-  const clipSwipeHint = isClipFinished && canGoToNextClip ? uiText.swipeUpForNextShort : "";
+  // 이 클립이 이 쇼츠(팩)의 진짜 마지막 콘텐츠가 아니면(다음 클립 또는 다음 쇼츠가 남아있으면) 스크롤 힌트 표시
+  const isVeryLastClip = !canGoToNextClip && isLastIdea;
+  const clipSwipeHint = isClipFinished && !isVeryLastClip ? uiText.swipeUpForNextShort : "";
   const shortVideoPosterSource =
     typeof shortVideo?.posterAsset === "number" ? shortVideo.posterAsset : undefined;
   const currentQuestion = quizQuestions[questionIndex] || null;
@@ -3092,6 +3677,8 @@ function ShortsLessonScreen({
     quizQuestions.length > 0 && answeredQuestionCount === quizQuestions.length;
   const estimatedBottomInset = Platform.OS === "ios" && windowHeight >= 780 ? 34 : 0;
   const estimatedTopInset = Platform.OS === "ios" ? (windowHeight >= 780 ? 54 : 32) : 18;
+  const shortTitleBarHeight = estimatedTopInset + 52;
+  const shortBottomTabBarHeight = 60 + estimatedBottomInset;
   const chatTopOffset =
     keyboardHeight > 0
       ? Math.max(96, Math.round(windowHeight * 0.13))
@@ -3116,6 +3703,30 @@ function ShortsLessonScreen({
     chatAvailableHeight,
     Math.max(chatMinimumHeight, chatTargetHeight)
   );
+
+  // 스크롤 힌트가 보일 때만 웹의 swipeBob과 같은 위아래 바운스 루프 애니메이션 실행
+  useEffect(() => {
+    if (!clipSwipeHint) {
+      swipeHintBounceAnim.setValue(0);
+      return;
+    }
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(swipeHintBounceAnim, {
+          toValue: 1,
+          duration: 600,
+          useNativeDriver: true,
+        }),
+        Animated.timing(swipeHintBounceAnim, {
+          toValue: 0,
+          duration: 600,
+          useNativeDriver: true,
+        }),
+      ])
+    );
+    loop.start();
+    return () => loop.stop();
+  }, [clipSwipeHint, swipeHintBounceAnim]);
 
   useEffect(() => {
     setAudioModeAsync({
@@ -3234,9 +3845,11 @@ function ShortsLessonScreen({
     setIsFetchingVideo(false);
     setVideoStatus(null);
     setSceneImageUrlsById({});
+    setPrefetchedSceneIds({});
     setIsQuizUnlocked(false);
     setIsQuizMode(false);
-    setIsSubtitleEnabled(false);
+    setIsClipFinished(false);
+    setIsSubtitleEnabled(true);
     setScrubPreviewMs(null);
     setSelectedAnswersByQuestion({});
     setQuestionIndex(0);
@@ -3253,6 +3866,11 @@ function ShortsLessonScreen({
       chatTypingTimerRef.current = null;
     }
     hasAutoplayAttemptedRef.current = false;
+    hasMarkedWatchedRef.current = false;
+    if (autoAdvanceToQuizTimerRef.current) {
+      clearTimeout(autoAdvanceToQuizTimerRef.current);
+      autoAdvanceToQuizTimerRef.current = null;
+    }
 
     if (!tts?.audioPath || tts?.audioStatus !== "ready") {
       if (tts?.audioStatus === "failed") {
@@ -3319,6 +3937,7 @@ function ShortsLessonScreen({
     });
 
     setSceneImageUrlsById({});
+    setPrefetchedSceneIds({});
 
     if (!imageScenes.length) {
       return () => {
@@ -3354,6 +3973,17 @@ function ShortsLessonScreen({
         }
 
         setSceneImageUrlsById(Object.fromEntries(entries));
+        // 서명 URL이 나온 것과 실제 이미지 파일 다운로드가 끝난 건 다르다 —
+        // 실제 다운로드가 끝난 장면만 "표시 준비 완료"로 표시해서 빈 화면 구간이 생기지 않게 함
+        entries.forEach(([sceneId, url]) => {
+          if (!url) return;
+          Promise.resolve(Image.prefetch(url))
+            .catch(() => {})
+            .then(() => {
+              if (!isMounted) return;
+              setPrefetchedSceneIds((current) => ({ ...current, [sceneId]: true }));
+            });
+        });
       })
       .catch(() => {
         if (isMounted) {
@@ -3367,13 +3997,19 @@ function ShortsLessonScreen({
   }, [idea?.id, scenes]);
 
   useEffect(() => {
-    if (hasPlayableVideo || !audioUrl || !status?.isLoaded || hasAutoplayAttemptedRef.current) {
+    if (
+      hasPlayableVideo ||
+      !audioUrl ||
+      !status?.isLoaded ||
+      hasAutoplayAttemptedRef.current ||
+      isWaitingForFirstImage
+    ) {
       return;
     }
 
     hasAutoplayAttemptedRef.current = true;
     player.play();
-  }, [audioUrl, hasPlayableVideo, player, status?.isLoaded]);
+  }, [audioUrl, hasPlayableVideo, isWaitingForFirstImage, player, status?.isLoaded]);
 
   const changeClip = useCallback((nextIndex) => {
     if (!clips || nextIndex < 0 || nextIndex >= totalClips || nextIndex === clipIndex) {
@@ -3411,25 +4047,57 @@ function ShortsLessonScreen({
     });
   }, [clipIndex, clips, hasPlayableVideo, player, totalClips]);
 
+  // 현재 재생 위치/길이를 ref로 보관(seekByMs 안정화)
+  const playbackRef = useRef({ cur: 0, dur: 0 });
+  playbackRef.current = { cur: Number(status?.currentTime || 0), dur: Number(playbackDurationSec || 0) };
+  const seekByMs = useCallback((deltaMs) => {
+    const { cur, dur } = playbackRef.current;
+    const targetSec = Math.min(Math.max(0, cur + deltaMs / 1000), Math.max(0.1, dur) - 0.1);
+    try {
+      const r = player.seekTo(targetSec);
+      if (r && typeof r.catch === "function") r.catch(() => {});
+    } catch (_) {}
+  }, [player]);
+  const goPrevShort = useCallback(() => onNavigateShort(-1), [onNavigateShort]);
+  const goNextShort = useCallback(() => onNavigateShort(1), [onNavigateShort]);
+
+  // 방향키(Expo Web): ↑ 이전 / ↓ 다음 쇼츠, ← 5초 되감기 / → 5초 빨리감기
+  useEffect(() => {
+    if (Platform.OS !== "web" || typeof window === "undefined") return undefined;
+    const onKey = (e) => {
+      if (e.key === "ArrowUp") { e.preventDefault(); goPrevShort(); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); goNextShort(); }
+      else if (e.key === "ArrowLeft") { e.preventDefault(); seekByMs(-5000); }
+      else if (e.key === "ArrowRight") { e.preventDefault(); seekByMs(5000); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [goPrevShort, goNextShort, seekByMs]);
+
+  // 스와이프(폰): 세로=이전/다음 쇼츠, 가로=±5초 seek
   const clipSwipePanResponder = useMemo(
     () =>
       PanResponder.create({
         onMoveShouldSetPanResponder: (_, gesture) =>
-          totalClips > 1 &&
-          Math.abs(gesture.dy) > SHORT_CLIP_SWIPE_THRESHOLD / 2 &&
-          Math.abs(gesture.dy) > Math.abs(gesture.dx) * 1.2,
+          Math.max(Math.abs(gesture.dx), Math.abs(gesture.dy)) > SHORT_CLIP_SWIPE_THRESHOLD / 2,
         onPanResponderRelease: (_, gesture) => {
-          if (gesture.dy <= -SHORT_CLIP_SWIPE_THRESHOLD && canGoToNextClip) {
-            changeClip(clipIndex + 1);
-            return;
-          }
-
-          if (gesture.dy >= SHORT_CLIP_SWIPE_THRESHOLD && canGoToPreviousClip) {
-            changeClip(clipIndex - 1);
+          const vertical = Math.abs(gesture.dy) >= Math.abs(gesture.dx);
+          if (vertical) {
+            if (gesture.dy <= -SHORT_CLIP_SWIPE_THRESHOLD) {
+              // 위로 스와이프 = 다음 쇼츠 (클립이 여러 개면 클립 먼저)
+              if (canGoToNextClip) changeClip(clipIndex + 1);
+              else goNextShort();
+            } else if (gesture.dy >= SHORT_CLIP_SWIPE_THRESHOLD) {
+              if (canGoToPreviousClip) changeClip(clipIndex - 1);
+              else goPrevShort();
+            }
+          } else {
+            if (gesture.dx <= -SHORT_CLIP_SWIPE_THRESHOLD) seekByMs(-5000);
+            else if (gesture.dx >= SHORT_CLIP_SWIPE_THRESHOLD) seekByMs(5000);
           }
         },
       }),
-    [canGoToNextClip, canGoToPreviousClip, changeClip, clipIndex, totalClips]
+    [canGoToNextClip, canGoToPreviousClip, changeClip, clipIndex, goNextShort, goPrevShort, seekByMs]
   );
 
   // Seek video to clip startMs when clip changes or video first loads
@@ -3461,7 +4129,7 @@ function ShortsLessonScreen({
       videoRef.current?.pauseAsync?.().catch(() => {});
       videoRef.current?.setPositionAsync(videoEndMs).catch(() => {});
 
-      if (!canGoToNextClip) {
+      if (!canGoToNextClip && isLastIdea) {
         setIsQuizUnlocked(true);
       }
     }
@@ -3469,6 +4137,7 @@ function ShortsLessonScreen({
     canGoToNextClip,
     hasPlayableVideo,
     isClipFinished,
+    isLastIdea,
     shortVideo?.endMs,
     videoStatus?.positionMillis,
     videoStatus?.isPlaying,
@@ -3478,7 +4147,7 @@ function ShortsLessonScreen({
     if (hasPlayableVideo) {
       if (videoStatus?.didJustFinish) {
         setIsClipFinished(true);
-        if (!canGoToNextClip) {
+        if (!canGoToNextClip && isLastIdea) {
           setIsQuizUnlocked(true);
         }
       }
@@ -3487,11 +4156,58 @@ function ShortsLessonScreen({
 
     if (status?.didJustFinish) {
       setIsClipFinished(true);
-      if (!canGoToNextClip) {
+      if (!canGoToNextClip && isLastIdea) {
         setIsQuizUnlocked(true);
       }
     }
-  }, [canGoToNextClip, hasPlayableVideo, status?.didJustFinish, videoStatus?.didJustFinish]);
+  }, [canGoToNextClip, hasPlayableVideo, isLastIdea, status?.didJustFinish, videoStatus?.didJustFinish]);
+
+  useEffect(() => {
+    if (!hasAudioFallback) {
+      return;
+    }
+
+    setIsClipFinished(true);
+    if (!canGoToNextClip && isLastIdea) {
+      setIsQuizUnlocked(true);
+    }
+  }, [canGoToNextClip, hasAudioFallback]);
+
+  // 이 쇼츠(아이디어)의 마지막 클립까지 다 봤으면, 퀴즈/화면 전환과 무관하게 "완료"로 기록
+  // (통합 퀴즈는 마지막 아이디어에서만 열리므로, 중간 아이디어들은 이 표시가 없으면 영영 완료로 안 남음)
+  useEffect(() => {
+    if (isClipFinished && !canGoToNextClip && idea?.id && !hasMarkedWatchedRef.current) {
+      hasMarkedWatchedRef.current = true;
+      onIdeaWatched(idea.id);
+    }
+  }, [canGoToNextClip, idea?.id, isClipFinished, onIdeaWatched]);
+
+  useEffect(() => {
+    if (autoAdvanceToQuizTimerRef.current) {
+      clearTimeout(autoAdvanceToQuizTimerRef.current);
+      autoAdvanceToQuizTimerRef.current = null;
+    }
+
+    if (!isClipFinished || canGoToNextClip || !isLastIdea || isQuizMode) {
+      return undefined;
+    }
+
+    autoAdvanceToQuizTimerRef.current = setTimeout(() => {
+      autoAdvanceToQuizTimerRef.current = null;
+      if (quizQuestions.length) {
+        openShortQuiz();
+      } else {
+        finishShortQuiz();
+      }
+    }, 1000);
+
+    return () => {
+      if (autoAdvanceToQuizTimerRef.current) {
+        clearTimeout(autoAdvanceToQuizTimerRef.current);
+        autoAdvanceToQuizTimerRef.current = null;
+      }
+    };
+  }, [canGoToNextClip, isClipFinished, isLastIdea, isQuizMode, quizQuestions.length]);
 
   useEffect(() => {
     if (!isChatOpen) {
@@ -3650,25 +4366,11 @@ function ShortsLessonScreen({
         pointerEvents="box-none"
         style={[
           styles.shortActionRail,
-          { bottom: 64 + estimatedBottomInset },
+          { bottom: 108 + estimatedBottomInset },
         ]}
       >
         <View style={styles.shortActionRailStack}>
-          <Pressable
-            accessibilityLabel={appLanguage === "ko" ? "ChatGPT에게 물어보기" : "Ask ChatGPT"}
-            accessibilityRole="button"
-            hitSlop={10}
-            onPress={openChatSheet}
-            style={styles.shortActionItem}
-          >
-            <Image
-              resizeMode="contain"
-              source={OPENAI_BLOSSOM_ICON}
-              style={styles.shortActionLogo}
-            />
-            <Text style={styles.shortActionLabel}>ChatGPT</Text>
-          </Pressable>
-
+          {/* 숏츠에서는 ChatGPT 버튼 제거 (ChatGPT는 학습카드에서만). 캡션 토글만 유지 */}
           <Pressable
             accessibilityLabel={isSubtitleEnabled ? uiText.hideSubtitles : uiText.showSubtitles}
             accessibilityRole="button"
@@ -3699,10 +4401,14 @@ function ShortsLessonScreen({
       audioSegments.find((segment) => segment.sceneId === targetScene.id) || audioSegments[nextIndex];
 
     if (targetSegment) {
+      const seekMs = Math.max(
+        0,
+        Number(targetSegment.startMs || 0) + (hasPlayableVideo ? videoStartOffsetMs : 0)
+      );
       if (hasPlayableVideo && videoRef.current?.setPositionAsync) {
-        videoRef.current.setPositionAsync(targetSegment.startMs).catch(() => {});
+        videoRef.current.setPositionAsync(seekMs).catch(() => {});
       } else {
-        player.seekTo(targetSegment.startMs / 1000).catch(() => {});
+        player.seekTo(seekMs / 1000).catch(() => {});
       }
     }
   }
@@ -3812,18 +4518,13 @@ function ShortsLessonScreen({
     setIsQuizMode(true);
   }
 
+  function finishShortQuiz() {
+    onFinish({ completeAllIdeas: true });
+  }
+
   function renderQuiz() {
     return (
       <View style={styles.shortQuizSection}>
-        <View style={styles.practiceHeaderRow}>
-          <Text style={styles.practiceHeaderLabel}>
-            {uiText.questionLabel(questionIndex + 1, quizQuestions.length)}
-          </Text>
-          <Text style={styles.practiceHeaderScore}>
-            {uiText.correctCount(correctAnswerCount, quizQuestions.length)}
-          </Text>
-        </View>
-
         {currentQuestion ? (
           <>
             <View style={styles.practiceQuestionCard}>
@@ -3878,7 +4579,7 @@ function ShortsLessonScreen({
             ) : null}
           </>
         ) : (
-          <SurfaceButton icon="check" label={uiText.finishIdea} onPress={onFinish} />
+          <SurfaceButton icon="check" label={uiText.finishIdea} onPress={finishShortQuiz} />
         )}
 
         {currentQuestion ? (
@@ -3902,7 +4603,7 @@ function ShortsLessonScreen({
                 disabled={!allPracticeQuestionsAnswered}
                 icon="check"
                 label={uiText.finishIdea}
-                onPress={onFinish}
+                onPress={finishShortQuiz}
                 style={[styles.practiceActionButton, styles.practiceActionButtonPrimary]}
               />
             )}
@@ -3928,26 +4629,28 @@ function ShortsLessonScreen({
                 posterSource={shortVideoPosterSource}
                 progressUpdateIntervalMillis={100}
                 ref={videoRef}
-                resizeMode={ResizeMode.COVER}
+                resizeMode={ResizeMode.CONTAIN}
                 shouldPlay
                 source={resolvedVideoSource}
                 style={styles.shortPlayerVideo}
                 useNativeControls={false}
                 usePoster={Boolean(shortVideoPosterSource)}
               />
-            ) : activeSceneImageUrl ? (
-              <View style={styles.shortPlayerStillFrame}>
-                <Image
-                  blurRadius={26}
-                  resizeMode="cover"
-                  source={{ uri: activeSceneImageUrl }}
-                  style={styles.shortPlayerStillBackdrop}
-                />
-                <Image
-                  resizeMode="contain"
-                  source={{ uri: activeSceneImageUrl }}
-                  style={styles.shortPlayerStillForeground}
-                />
+            ) : isWaitingForFirstImage ? (
+              <View style={styles.shortPlayerLoadingStage}>
+                <ActivityIndicator color="#FFFFFF" size="large" />
+              </View>
+            ) : activeScene ? (
+              <View
+                style={[
+                  styles.shortSceneSlideFrame,
+                  {
+                    bottom: shortBottomTabBarHeight + 8,
+                    top: shortTitleBarHeight,
+                  },
+                ]}
+              >
+                <SceneSlide scene={activeScene} sceneImageUrl={activeSceneImageUrl} />
               </View>
             ) : shortVideoPosterSource ? (
               <View style={styles.shortPlayerStillFrame}>
@@ -3974,20 +4677,11 @@ function ShortsLessonScreen({
                 pointerEvents="none"
                 style={[
                   styles.shortSubtitleOverlay,
-                  { bottom: 120 + estimatedBottomInset },
+                  { bottom: 176 + estimatedBottomInset },
                 ]}
               >
                 <Text style={styles.shortSubtitleText}>
                   {displayedSubtitleText}
-                </Text>
-              </View>
-            ) : null}
-
-            {isFetchingVideo || isFetchingAudio ? (
-              <View style={styles.shortPlayerCenterOverlay}>
-                <ActivityIndicator color="#FFF8EA" size="small" />
-                <Text style={styles.shortPlayerOverlayText}>
-                  {isFetchingVideo ? uiText.videoPreparing : uiText.audioPreparing}
                 </Text>
               </View>
             ) : null}
@@ -4007,16 +4701,14 @@ function ShortsLessonScreen({
             ) : null}
 
             {!isFetchingAudio && !hasPlayableVideo && audioError ? (
-              <View style={styles.shortPlayerCenterOverlay}>
+              <View
+                pointerEvents="box-none"
+                style={[
+                  styles.shortPlayerAudioNotice,
+                  { top: estimatedTopInset + 58 },
+                ]}
+              >
                 <Text style={styles.shortPlayerErrorText}>{audioError}</Text>
-                {!isQuizUnlocked ? (
-                  <SurfaceButton
-                    secondary
-                    label={uiText.continueWithoutAudio}
-                    onPress={() => setIsQuizUnlocked(true)}
-                    style={styles.shortOverlayAction}
-                  />
-                ) : null}
               </View>
             ) : null}
           </Pressable>
@@ -4029,32 +4721,38 @@ function ShortsLessonScreen({
                 { bottom: 116 + estimatedBottomInset },
               ]}
             >
-              <Text style={styles.shortClipSwipeHintText}>{clipSwipeHint}</Text>
+              <Animated.View
+                style={{
+                  alignItems: "center",
+                  transform: [
+                    {
+                      translateY: swipeHintBounceAnim.interpolate({
+                        inputRange: [0, 1],
+                        outputRange: [0, -6],
+                      }),
+                    },
+                  ],
+                }}
+              >
+                <Feather color="rgba(255,255,255,0.85)" name="chevron-up" size={22} />
+                <Text style={styles.shortClipSwipeHintText}>{uiText.scrollHint}</Text>
+              </Animated.View>
             </View>
           ) : null}
 
-          {isQuizUnlocked ? (
+          {hasAudioFallback && isClipFinished && canGoToNextClip ? (
             <View
               style={[
                 styles.shortPlayerQuizCtaWrap,
-                { bottom: 96 + estimatedBottomInset },
+                { bottom: 156 + estimatedBottomInset },
               ]}
             >
-              {quizQuestions.length ? (
-                <SurfaceButton
-                  icon="quiz"
-                  label={uiText.startQuiz}
-                  onPress={openShortQuiz}
-                  style={styles.shortPlayerQuizCta}
-                />
-              ) : (
-                <SurfaceButton
-                  icon="check"
-                  label={uiText.finishIdea}
-                  onPress={onFinish}
-                  style={styles.shortPlayerQuizCta}
-                />
-              )}
+              <SurfaceButton
+                icon="play-arrow"
+                label={uiText.swipeUpForNextShort}
+                onPress={() => changeClip(clipIndex + 1)}
+                style={styles.shortPlayerQuizCta}
+              />
             </View>
           ) : null}
 
@@ -4062,7 +4760,7 @@ function ShortsLessonScreen({
             pointerEvents="box-none"
             style={[
               styles.shortPlayerBottomOverlay,
-              { bottom: 44 + estimatedBottomInset },
+              { bottom: shortBottomTabBarHeight + 18 },
             ]}
           >
             <ShortsSeekBar
@@ -4079,20 +4777,94 @@ function ShortsLessonScreen({
           </View>
 
           <View
+            style={[
+              styles.shortTopTitleBar,
+              { height: shortTitleBarHeight, paddingTop: estimatedTopInset },
+            ]}
+          >
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => { try { player.pause(); } catch (_) {} onClose(); }}
+              style={styles.shortBackButton}
+            >
+              <Feather color="#0A0A0A" name="chevron-left" size={34} />
+            </Pressable>
+            <Text numberOfLines={1} style={styles.shortTopTitleText}>
+              {pack?.title || ""}
+            </Text>
+          </View>
+
+          <View
             pointerEvents="box-none"
             style={[
               styles.shortTopOverlay,
-              { top: estimatedTopInset },
+              { top: shortTitleBarHeight + 10 },
             ]}
           >
-            <Pressable accessibilityRole="button" onPress={onClose} style={styles.shortBackButton}>
-              <Feather color="#000000" name="chevron-left" size={34} />
-            </Pressable>
-            {totalClips > 1 ? (
-              <View style={styles.clipCounterBadge}>
-                <Text style={styles.clipCounterText}>{clipIndex + 1}/{totalClips}</Text>
+            {(chapterLabel || subsectionLabel) ? (
+              <View style={styles.shortChapterChip}>
+                {chapterLabel ? (
+                  <Text numberOfLines={1} style={styles.shortChapterChipTop}>{chapterLabel}</Text>
+                ) : null}
+                {subsectionLabel ? (
+                  <Text numberOfLines={1} style={styles.shortChapterChipSub}>{subsectionLabel}</Text>
+                ) : null}
               </View>
-            ) : null}
+            ) : <View />}
+            <View style={styles.shortSpeedBar}>
+              {[1, 1.25, 1.5, 2].map((rate) => (
+                <Pressable
+                  key={rate}
+                  accessibilityRole="button"
+                  hitSlop={6}
+                  onPress={() => setPlaybackRate(rate)}
+                  style={[styles.shortSpeedItem, playbackRate === rate ? styles.shortSpeedItemOn : null]}
+                >
+                  <Text style={[styles.shortSpeedText, playbackRate === rate ? styles.shortSpeedTextOn : null]}>
+                    {rate === 1 ? "1x" : `${rate}x`}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
+
+          <View
+            pointerEvents="none"
+            style={[
+              styles.shortIdeaProgressOverlay,
+              { top: shortTitleBarHeight + 64 },
+            ]}
+          >
+            <View style={styles.shortIdeaProgressTrack}>
+              {Array.from({ length: totalIdeas }).map((_, index) => (
+                <View
+                  key={`short-progress-${index}`}
+                  style={[
+                    styles.shortIdeaProgressDot,
+                    index < ideaIndex ? styles.shortIdeaProgressDotDone : null,
+                    index === ideaIndex ? styles.shortIdeaProgressDotCurrent : null,
+                  ]}
+                />
+              ))}
+            </View>
+            <Text style={styles.shortIdeaProgressLabel}>
+              {ideaIndex + 1}/{totalIdeas}
+            </Text>
+          </View>
+
+          <View pointerEvents="box-none" style={styles.shortBottomTabBar}>
+            <View style={styles.shortBottomTabItem}>
+              <Feather color="rgba(10,10,10,0.45)" name="home" size={24} />
+              <Text style={styles.shortBottomTabLabel}>홈</Text>
+            </View>
+            <View style={styles.shortBottomTabItem}>
+              <Feather color="rgba(10,10,10,0.45)" name="list" size={24} />
+              <Text style={styles.shortBottomTabLabel}>목차</Text>
+            </View>
+            <View style={styles.shortBottomTabItem}>
+              <Feather color="#0A0A0A" name="play-circle" size={24} />
+              <Text style={[styles.shortBottomTabLabel, styles.shortBottomTabLabelActive]}>숏츠</Text>
+            </View>
           </View>
         </View>
       </View>
@@ -4115,17 +4887,13 @@ function ShortsLessonScreen({
     return (
       <SafeAreaView style={styles.safeArea}>
         <StatusBar style="dark" />
-        <View style={styles.lessonScreenShell}>
-          <View style={styles.topBar}>
-            <Pressable accessibilityRole="button" onPress={() => setIsQuizMode(false)} style={styles.roundButton}>
+        <View style={styles.shortQuizShell}>
+          <View style={styles.shortQuizTopBar}>
+            <Pressable accessibilityRole="button" onPress={() => setIsQuizMode(false)} style={styles.shortQuizBackButton}>
               <Feather color={palette.ink} name="chevron-left" size={24} />
             </Pressable>
-            <View style={styles.topBarTitleWrap}>
-              <Text numberOfLines={2} style={styles.topBarTitle}>
-                {uiText.startQuiz}
-              </Text>
-            </View>
-            <View style={styles.topBarSpacer} />
+            <Text numberOfLines={1} style={styles.shortQuizTopTitle}>{uiText.startQuiz}</Text>
+            <View style={styles.shortQuizBackButtonPlaceholder} />
           </View>
           {renderShortQuizMode()}
         </View>
@@ -4135,7 +4903,7 @@ function ShortsLessonScreen({
 
   return (
     <View style={styles.shortFullscreenRoot}>
-      <StatusBar style="light" />
+      <StatusBar style="dark" />
       <View style={styles.lessonScreenShell}>
         {renderShortPlayer()}
         {!isChatOpen ? renderActionRail() : null}
@@ -4654,17 +5422,6 @@ function LessonScreen({
         <View style={styles.practiceStepContent}>
           {currentPracticeQuestion ? (
             <>
-              <View style={styles.practiceHeaderRow}>
-                <Text style={styles.practiceHeaderLabel}>
-                  {hasMultiplePracticeQuestions
-                    ? uiText.questionLabel(practiceQuestionIndex + 1, practiceQuestions.length)
-                    : uiText.practiceQuestion}
-                </Text>
-                <Text style={styles.practiceHeaderScore}>
-                  {uiText.correctCount(correctAnswerCount, practiceQuestions.length)}
-                </Text>
-              </View>
-
               <View style={styles.practiceQuestionCard}>
                 <Text style={styles.practiceQuestion}>{currentPracticeQuestion.question}</Text>
               </View>
@@ -5203,15 +5960,6 @@ function PackReviewScreen({ pack, onBack, onClose, onFinish, appLanguage }) {
 
         {currentQuestion ? (
           <>
-            <View style={styles.practiceHeaderRow}>
-              <Text style={styles.practiceHeaderLabel}>
-                {uiText.questionLabel(questionIndex + 1, reviewQuestions.length)}
-              </Text>
-              <Text style={styles.practiceHeaderScore}>
-                {uiText.correctCount(correctAnswerCount, reviewQuestions.length)}
-              </Text>
-            </View>
-
             <View style={styles.practiceQuestionCard}>
               <Text style={styles.practiceQuestion}>{currentQuestion.question}</Text>
             </View>
@@ -5341,15 +6089,20 @@ function CompletionScreen({
   const packReviewResult = getPackReviewResult(progressByPack, pack.id);
   const hasPackReview = getPackReviewQuestions(pack).length > 0;
   const shouldShowPackReview = !nextIdea && hasPackReview && !packReviewCompleted;
+  const isPackComplete = !nextIdea && !shouldShowPackReview;
   const heroTitle = shouldShowPackReview
     ? uiText.finalReviewPending
     : !nextIdea && packReviewResult
       ? uiText.finalReviewComplete
+      : isPackComplete
+        ? uiText.packComplete
       : uiText.niceWork;
   const heroBody = shouldShowPackReview
     ? uiText.finalReviewBody
     : !nextIdea && packReviewResult
       ? uiText.finalReviewResult(packReviewResult.score, packReviewResult.totalQuestions)
+      : isPackComplete
+        ? uiText.packCompleteBody
       : uiText.completionBody;
 
   return (
@@ -5414,13 +6167,13 @@ function CompletionScreen({
             onPress={onNextIdea}
           />
         ) : (
-          <SurfaceButton icon="home" label={uiText.backHome} onPress={onBackHome} />
+          <SurfaceButton icon="check" label={uiText.finishPack} onPress={onBackHome} />
         )}
 
         <SurfaceButton
           secondary
           icon="menu-book"
-          label={uiText.reviewPack}
+          label={isPackComplete ? uiText.reviewCompletedPack : uiText.reviewPack}
           onPress={onReviewPack}
         />
       </ScrollView>
@@ -5428,7 +6181,100 @@ function CompletionScreen({
   );
 }
 
-export default function RootApp() {
+function getGenerationStepIndex(stepText = "") {
+  const normalized = String(stepText || "").toLowerCase();
+  if (/quiz|퀴즈|문제/.test(normalized)) return 4;
+  if (/image|이미지|시각자료|visual/.test(normalized)) return 3;
+  if (/tts|음성|audio|voice|합성/.test(normalized)) return 2;
+  if (/script|스크립트|scene|장면|쇼츠/.test(normalized)) return 1;
+  if (/text|텍스트|분석|원문|핵심|개념|extract/.test(normalized)) return 0;
+  return 0;
+}
+
+function GenerationProgressScreen({ pendingGeneration, appLanguage }) {
+  const insets = useSafeAreaInsets();
+  const appText = getAppUiText(appLanguage);
+  const stepText =
+    pendingGeneration?.step ||
+    (appLanguage === "ko" ? "원문 구조 분석 중..." : "Analyzing source text...");
+  const activeStepIndex = getGenerationStepIndex(stepText);
+
+  function getStepState(index) {
+    if (index < activeStepIndex) return "done";
+    if (index === activeStepIndex) return "now";
+    return "idle";
+  }
+
+  function getStepDesc(step, index) {
+    const state = getStepState(index);
+    if (state === "done") {
+      if (step.id === "analysis") return "핵심 개념 추출 완료";
+      if (step.id === "script") return "장면 구성 완료";
+      if (step.id === "tts") return "음성 합성 완료";
+      if (step.id === "image") return "이미지 생성 완료";
+      return "퀴즈 생성 완료";
+    }
+    if (state === "now") return stepText;
+    return step.waiting;
+  }
+
+  function getStepGlyph(index) {
+    const state = getStepState(index);
+    if (state === "done") return "✅";
+    if (state === "now") return "⏳";
+    return "···";
+  }
+
+  return (
+    <SafeAreaView style={styles.webGenSafeArea}>
+      <StatusBar style="dark" />
+      <View style={[styles.webGenWrap, { paddingTop: Math.max(96, insets.top + 86) }]}>
+        <View style={styles.webGenOrbOuter}>
+          <View style={styles.webGenOrb} />
+        </View>
+        <Text style={styles.webGenTitle}>AI가 만들고 있어요</Text>
+        <Text style={styles.webGenSubtitle}>
+          {pendingGeneration?.title ? `${pendingGeneration.title} 생성 중...` : "쇼츠 생성 중..."}
+        </Text>
+
+        <View style={styles.webGenSteps}>
+          {WEB_GENERATION_STEPS.map((step, index) => {
+            const state = getStepState(index);
+            return (
+              <View
+                key={step.id}
+                style={[
+                  styles.webGenStep,
+                  state === "done" && styles.webGenStepDone,
+                  state === "now" && styles.webGenStepNow,
+                ]}
+              >
+                <Text style={styles.webGenStepIcon}>{step.icon}</Text>
+                <View style={styles.webGenStepTextWrap}>
+                  <Text style={styles.webGenStepName}>{step.name}</Text>
+                  <Text style={[styles.webGenStepDesc, state === "now" && styles.webGenStepDescNow]}>
+                    {getStepDesc(step, index)}
+                  </Text>
+                </View>
+                <Text style={styles.webGenStepGlyph}>{getStepGlyph(index)}</Text>
+              </View>
+            );
+          })}
+        </View>
+
+        {pendingGeneration?.status === "error" ? (
+          <View style={styles.webGenErrorCard}>
+            <Text style={styles.webGenErrorTitle}>{appText.generationFailedShort}</Text>
+            <Text style={styles.webGenErrorBody}>{pendingGeneration.error}</Text>
+          </View>
+        ) : null}
+      </View>
+    </SafeAreaView>
+  );
+}
+
+function RootAppContent() {
+  const [createSheetRequestId, setCreateSheetRequestId] = useState(0);
   const {
     abortGenRef,
     activeIdea,
@@ -5442,7 +6288,9 @@ export default function RootApp() {
     finishIdea,
     finishPackReview,
     handleGoogleLogin,
+    handleGuestLogin,
     handleLogout,
+    markIdeaWatched,
     openIdea,
     openNextIdea,
     openPack,
@@ -5478,6 +6326,10 @@ export default function RootApp() {
     withPackTouch,
   });
 
+  function openHomeCreateSheet() {
+    openStudio("default", null, "shorts");
+  }
+
   if (authLoading) {
     return (
       <SafeAreaView style={[styles.safeArea, { justifyContent: "center", alignItems: "center" }]}>
@@ -5487,7 +6339,16 @@ export default function RootApp() {
   }
 
   if (!session) {
-    return <LoginScreen onGoogleLogin={handleGoogleLogin} loading={false} appLanguage={appLanguage} />;
+    return <LoginScreen onGoogleLogin={handleGoogleLogin} onGuestLogin={handleGuestLogin} loading={false} appLanguage={appLanguage} />;
+  }
+
+  if (pendingGeneration?.status === "loading") {
+    return (
+      <GenerationProgressScreen
+        appLanguage={appLanguage}
+        pendingGeneration={pendingGeneration}
+      />
+    );
   }
 
   if (screen === "home") {
@@ -5497,12 +6358,48 @@ export default function RootApp() {
         onChangeLanguage={setAppLanguage}
         onDismissPending={dismissPendingGeneration}
         onLogout={handleLogout}
+        onHome={() => setScreen("home")}
         onOpenPack={openPack}
+        onOpenPacks={() => setScreen("packs")}
+        onOpenProfile={() => setScreen("profile")}
         onOpenStudio={openStudio}
         onRemovePack={removeGeneratedPack}
+        onStartGenerate={startBackgroundGenerate}
         onUpdateTitle={updatePackTitle}
         packs={packs}
         pendingGeneration={pendingGeneration}
+        progressByPack={progressByPack}
+        user={session?.user}
+        createSheetRequestId={createSheetRequestId}
+      />
+    );
+  }
+
+  if (screen === "packs") {
+    return (
+      <PackListScreen
+        appLanguage={appLanguage}
+        onOpenHome={() => setScreen("home")}
+        onOpenPack={openPack}
+        onOpenProfile={() => setScreen("profile")}
+        onOpenStudio={openHomeCreateSheet}
+        onRemovePack={removeGeneratedPack}
+        onUpdateTitle={updatePackTitle}
+        packs={packs}
+        progressByPack={progressByPack}
+      />
+    );
+  }
+
+  if (screen === "profile") {
+    return (
+      <WebProfileScreen
+        appLanguage={appLanguage}
+        onLogout={handleLogout}
+        onOpenHome={() => setScreen("home")}
+        onOpenPacks={() => setScreen("packs")}
+        onOpenStudio={openHomeCreateSheet}
+        packs={packs}
         progressByPack={progressByPack}
         user={session?.user}
       />
@@ -5527,10 +6424,12 @@ export default function RootApp() {
     return (
       <DetailScreen
         appLanguage={appLanguage}
-        onBack={() => setScreen("home")}
+        onBack={() => setScreen("packs")}
+        onOpenHome={() => setScreen("home")}
+        onOpenPacks={() => setScreen("packs")}
+        onOpenProfile={() => setScreen("profile")}
+        onOpenStudio={openHomeCreateSheet}
         onStartIdea={openIdea}
-        onStartPackReview={openPackReview}
-        onUpdateTitle={(newTitle) => updatePackTitle(activePack.id, newTitle)}
         pack={activePack}
         progressByPack={progressByPack}
       />
@@ -5538,6 +6437,18 @@ export default function RootApp() {
   }
 
   if (screen === "lesson") {
+    if (isDeckPack(activePack)) {
+      return (
+        <DeckLessonScreen
+          appLanguage={appLanguage}
+          idea={activeIdea}
+          onClose={closeToPack}
+          onFinish={finishIdea}
+          pack={activePack}
+        />
+      );
+    }
+
     if (isShortsPack(activePack)) {
       return (
         <ShortsLessonScreen
@@ -5546,6 +6457,13 @@ export default function RootApp() {
           idea={activeIdea}
           onClose={closeToPack}
           onFinish={finishIdea}
+          onIdeaWatched={(ideaId) => markIdeaWatched(activePackId, ideaId)}
+          onNavigateShort={(delta) => {
+            const list = Array.isArray(activePack?.ideas) ? activePack.ideas : [];
+            const i = list.findIndex((x) => x.id === activeIdea?.id);
+            const target = list[i + delta];
+            if (target) openIdea(activePackId, target.id);
+          }}
           onUpdateChat={(nextMessages) => updateIdeaChat(activePackId, activeIdea.id, nextMessages)}
           pack={activePack}
         />
@@ -5588,6 +6506,14 @@ export default function RootApp() {
       pack={activePack}
       progressByPack={progressByPack}
     />
+  );
+}
+
+export default function RootApp() {
+  return (
+    <SafeAreaProvider>
+      <RootAppContent />
+    </SafeAreaProvider>
   );
 }
 
@@ -5639,13 +6565,37 @@ const loginStyles = StyleSheet.create({
     elevation: 2,
   },
   googleIcon: {
-    width: 20,
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    borderColor: palette.line,
+    borderRadius: 10,
+    borderWidth: 1,
     height: 20,
+    justifyContent: "center",
+    width: 20,
+  },
+  googleIconText: {
+    color: "#4285F4",
+    fontSize: 14,
+    fontWeight: "900",
+    lineHeight: 18,
   },
   googleButtonText: {
     fontSize: 16,
     fontWeight: "600",
     color: palette.ink,
+  },
+  guestButton: {
+    marginTop: 12,
+    paddingVertical: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  guestButtonText: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: palette.muted,
+    textDecorationLine: "underline",
   },
   disclaimer: {
     fontSize: 12,
@@ -5667,6 +6617,733 @@ const styles = StyleSheet.create({
     paddingTop: 18,
     paddingBottom: 40,
     gap: 18,
+  },
+  webHomeScroll: {
+    gap: 0,
+    paddingHorizontal: 22,
+    paddingTop: 18,
+    paddingBottom: 20,
+  },
+  webHomeTop: {
+    alignItems: "center",
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 20,
+  },
+  webLogo: {
+    color: palette.ink,
+    fontSize: 34,
+    fontWeight: "900",
+    letterSpacing: -1,
+  },
+  webLogoAccent: {
+    color: palette.accent,
+  },
+  webHero: {
+    backgroundColor: palette.ink,
+    borderRadius: 22,
+    marginBottom: 22,
+    paddingHorizontal: 20,
+    paddingTop: 22,
+    paddingBottom: 20,
+  },
+  webHeroChip: {
+    alignSelf: "flex-start",
+    backgroundColor: palette.accent,
+    borderRadius: 999,
+    color: "#FFFFFF",
+    fontSize: 11,
+    fontWeight: "900",
+    letterSpacing: 1.6,
+    marginBottom: 12,
+    overflow: "hidden",
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  webHeroTitle: {
+    color: "#FFFFFF",
+    fontSize: 32,
+    fontWeight: "900",
+    lineHeight: 40,
+    marginBottom: 8,
+  },
+  webHeroSub: {
+    color: withAlpha("#FFFFFF", "88"),
+    fontSize: 17,
+    fontWeight: "800",
+    marginBottom: 20,
+  },
+  webHeroButton: {
+    alignSelf: "flex-start",
+    backgroundColor: palette.accent,
+    borderRadius: 999,
+    paddingHorizontal: 22,
+    paddingVertical: 13,
+  },
+  webHeroButtonText: {
+    color: "#FFFFFF",
+    fontSize: 16,
+    fontWeight: "900",
+  },
+  webSectionLabel: {
+    color: "#8BA8BB",
+    fontSize: 13,
+    fontWeight: "900",
+    letterSpacing: 1.6,
+    marginBottom: 12,
+    textTransform: "uppercase",
+  },
+  webPackList: {
+    gap: 8,
+  },
+  webPackCard: {
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    borderColor: palette.line,
+    borderRadius: 16,
+    borderWidth: 1,
+    flexDirection: "row",
+    gap: 12,
+    minHeight: 88,
+    paddingHorizontal: 14,
+    paddingVertical: 13,
+    position: "relative",
+  },
+  webPackIcon: {
+    alignItems: "center",
+    backgroundColor: withAlpha(palette.accent, "18"),
+    borderRadius: 12,
+    height: 48,
+    justifyContent: "center",
+    width: 48,
+  },
+  webPackIcon_shorts: {
+    backgroundColor: withAlpha(palette.accent, "18"),
+  },
+  webPackIcon_cards: {
+    backgroundColor: withAlpha(palette.teal, "14"),
+  },
+  webPackIcon_deck: {
+    backgroundColor: withAlpha(palette.ink, "10"),
+  },
+  webPackBody: {
+    flex: 1,
+    minWidth: 0,
+    paddingRight: 34,
+  },
+  webPackTitleRow: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: 6,
+    minWidth: 0,
+  },
+  webPackTitle: {
+    color: palette.ink,
+    flexShrink: 1,
+    fontSize: 17,
+    fontWeight: "900",
+    lineHeight: 22,
+  },
+  webPackTitleInput: {
+    borderColor: palette.accent,
+    borderRadius: 8,
+    borderWidth: 1.5,
+    color: palette.ink,
+    flex: 1,
+    fontSize: 15,
+    fontWeight: "900",
+    minHeight: 32,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  webPackMeta: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: "700",
+    marginTop: 2,
+  },
+  webPackEdit: {
+    alignItems: "center",
+    backgroundColor: "transparent",
+    borderRadius: 999,
+    height: 26,
+    justifyContent: "center",
+    width: 26,
+  },
+  webPackProgressTrack: {
+    alignItems: "center",
+    backgroundColor: withAlpha(palette.line, "D8"),
+    borderRadius: 999,
+    height: 16,
+    justifyContent: "center",
+    marginTop: 8,
+    overflow: "hidden",
+    position: "relative",
+    width: "100%",
+  },
+  webPackProgressFill: {
+    backgroundColor: palette.success,
+    borderRadius: 999,
+    bottom: 0,
+    left: 0,
+    position: "absolute",
+    top: 0,
+  },
+  webPackProgressText: {
+    color: palette.ink,
+    fontSize: 11,
+    fontWeight: "900",
+    lineHeight: 14,
+    textAlign: "center",
+    zIndex: 2,
+  },
+  webPackDelete: {
+    alignItems: "center",
+    backgroundColor: withAlpha(palette.ink, "08"),
+    borderRadius: 999,
+    height: 28,
+    justifyContent: "center",
+    position: "absolute",
+    right: 8,
+    top: 8,
+    width: 28,
+  },
+  webEmptyPack: {
+    backgroundColor: withAlpha("#FFFFFF", "B8"),
+    borderColor: palette.line,
+    borderRadius: 16,
+    borderStyle: "dashed",
+    borderWidth: 1,
+    paddingHorizontal: 16,
+    paddingVertical: 18,
+  },
+  webEmptyTitle: {
+    color: palette.ink,
+    fontSize: 15,
+    fontWeight: "900",
+    textAlign: "center",
+  },
+  webEmptySub: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: "700",
+    marginTop: 4,
+    textAlign: "center",
+  },
+  webTabBar: {
+    alignItems: "flex-start",
+    backgroundColor: "#FFFFFF",
+    borderTopColor: palette.line,
+    borderTopWidth: 1,
+    flexDirection: "row",
+    height: 80,
+    paddingTop: 10,
+  },
+  webTabItem: {
+    alignItems: "center",
+    flex: 1,
+    gap: 4,
+    paddingTop: 2,
+  },
+  webTabIcon: {
+    fontSize: 22,
+  },
+  webTabLabel: {
+    color: "#8BA8BB",
+    fontSize: 11,
+    fontWeight: "800",
+  },
+  webTabLabelActive: {
+    color: palette.accent,
+  },
+  webPacksScroll: {
+    paddingHorizontal: 22,
+    paddingTop: 24,
+    paddingBottom: 92,
+  },
+  webPacksTitle: {
+    color: palette.ink,
+    fontSize: 24,
+    fontWeight: "900",
+    marginBottom: 4,
+    marginTop: 6,
+  },
+  webPacksSub: {
+    color: palette.muted,
+    fontSize: 14,
+    fontWeight: "700",
+    marginBottom: 20,
+  },
+  webPacksEmpty: {
+    alignItems: "center",
+    gap: 10,
+    justifyContent: "center",
+    minHeight: 260,
+  },
+  webPacksEmptyIcon: {
+    fontSize: 34,
+  },
+  webEmptyButton: {
+    backgroundColor: palette.accent,
+    borderRadius: 999,
+    marginTop: 4,
+    paddingHorizontal: 15,
+    paddingVertical: 10,
+  },
+  webEmptyButtonText: {
+    color: "#FFFFFF",
+    fontSize: 13,
+    fontWeight: "900",
+  },
+  webBackButton: {
+    alignSelf: "flex-start",
+    marginBottom: 18,
+  },
+  webBackButtonText: {
+    color: palette.teal,
+    fontSize: 16,
+    fontWeight: "800",
+  },
+  webTocScroll: {
+    paddingHorizontal: 22,
+    paddingTop: 24,
+    paddingBottom: 92,
+  },
+  webTocKicker: {
+    color: palette.accent,
+    fontSize: 12,
+    fontWeight: "900",
+    letterSpacing: 2,
+    marginBottom: 8,
+  },
+  webTocTitle: {
+    color: palette.ink,
+    fontSize: 34,
+    fontWeight: "900",
+    lineHeight: 40,
+    marginBottom: 6,
+  },
+  webTocSub: {
+    color: palette.muted,
+    fontSize: 15,
+    fontWeight: "800",
+    marginBottom: 18,
+  },
+  webTocList: {
+    gap: 9,
+  },
+  webTocGroup: {
+    backgroundColor: withAlpha("#FFFFFF", "C8"),
+    borderColor: palette.line,
+    borderRadius: 18,
+    borderWidth: 1,
+    overflow: "hidden",
+  },
+  webTocGroupHead: {
+    alignItems: "center",
+    borderBottomColor: palette.line,
+    borderBottomWidth: 1,
+    flexDirection: "row",
+    gap: 12,
+    padding: 14,
+  },
+  webTocNum: {
+    alignItems: "center",
+    backgroundColor: withAlpha(palette.accent, "24"),
+    borderRadius: 12,
+    height: 38,
+    justifyContent: "center",
+    width: 38,
+  },
+  webTocNumMajor: {
+    backgroundColor: palette.ink,
+  },
+  webTocNumText: {
+    color: palette.accent,
+    fontSize: 13,
+    fontWeight: "900",
+  },
+  webTocNumTextMajor: {
+    color: "#FFFFFF",
+  },
+  webTocBody: {
+    flex: 1,
+    minWidth: 0,
+  },
+  webTocGroupTitle: {
+    color: palette.ink,
+    fontSize: 18,
+    fontWeight: "900",
+    lineHeight: 23,
+    marginBottom: 4,
+  },
+  webTocSummary: {
+    color: palette.muted,
+    fontSize: 13,
+    fontWeight: "700",
+    lineHeight: 18,
+  },
+  webTocChild: {
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    borderTopColor: withAlpha(palette.line, "AA"),
+    borderTopWidth: 1,
+    flexDirection: "row",
+    gap: 10,
+    minHeight: 66,
+    paddingHorizontal: 13,
+    paddingVertical: 12,
+  },
+  webTocChildNum: {
+    alignItems: "center",
+    backgroundColor: withAlpha(palette.accent, "24"),
+    borderRadius: 999,
+    height: 30,
+    justifyContent: "center",
+    minWidth: 42,
+    paddingHorizontal: 8,
+  },
+  webTocChildNumText: {
+    color: palette.accent,
+    fontSize: 13,
+    fontWeight: "900",
+  },
+  webTocItemTitle: {
+    color: palette.ink,
+    fontSize: 17,
+    fontWeight: "900",
+    lineHeight: 22,
+    marginBottom: 4,
+  },
+  webTocCount: {
+    alignItems: "center",
+    backgroundColor: withAlpha(palette.teal, "18"),
+    borderRadius: 999,
+    height: 30,
+    justifyContent: "center",
+    width: 30,
+  },
+  webTocCountText: {
+    color: palette.teal,
+    fontSize: 13,
+    fontWeight: "900",
+  },
+  webProfileHero: {
+    alignItems: "center",
+    gap: 10,
+    paddingBottom: 20,
+    paddingTop: 24,
+  },
+  webProfileAvatar: {
+    alignItems: "center",
+    backgroundColor: palette.ink,
+    borderRadius: 999,
+    height: 72,
+    justifyContent: "center",
+    width: 72,
+  },
+  webProfileAvatarText: {
+    color: "#FFFFFF",
+    fontSize: 28,
+    fontWeight: "900",
+  },
+  webProfileName: {
+    color: palette.ink,
+    fontSize: 20,
+    fontWeight: "900",
+  },
+  webProfileEmail: {
+    color: palette.muted,
+    fontSize: 12,
+    fontWeight: "700",
+  },
+  webProfileBadge: {
+    backgroundColor: withAlpha(palette.accent, "20"),
+    borderColor: withAlpha(palette.accent, "55"),
+    borderRadius: 999,
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+  },
+  webProfileBadgeText: {
+    color: palette.accent,
+    fontSize: 11,
+    fontWeight: "900",
+  },
+  webProfileStats: {
+    flexDirection: "row",
+    gap: 10,
+    marginBottom: 20,
+  },
+  webProfileStatBox: {
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    borderColor: palette.line,
+    borderRadius: 16,
+    borderWidth: 1,
+    flex: 1,
+    padding: 14,
+  },
+  webProfileStatNumber: {
+    color: palette.ink,
+    fontSize: 22,
+    fontWeight: "900",
+  },
+  webProfileStatLabel: {
+    color: palette.muted,
+    fontSize: 11,
+    fontWeight: "800",
+    marginTop: 2,
+  },
+  webProfileList: {
+    gap: 2,
+  },
+  webProfileItem: {
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    borderColor: palette.line,
+    borderWidth: 1,
+    flexDirection: "row",
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  webProfileItemText: {
+    color: palette.ink,
+    fontSize: 15,
+    fontWeight: "800",
+  },
+  webProfileItemRight: {
+    color: palette.muted,
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  deckLessonSafeArea: {
+    flex: 1,
+    backgroundColor: "#F6F3EA",
+  },
+  deckLessonTopBar: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: 12,
+    paddingHorizontal: 20,
+    paddingTop: 10,
+    paddingBottom: 12,
+  },
+  deckLessonTopTitle: {
+    color: "#153A5B",
+    flex: 1,
+    fontSize: 17,
+    fontWeight: "900",
+    textAlign: "center",
+  },
+  roundButtonPlaceholder: {
+    width: 44,
+    height: 44,
+  },
+  deckLessonContent: {
+    paddingHorizontal: 14,
+    paddingBottom: 128,
+    gap: 14,
+  },
+  deckSlideFrame: {
+    aspectRatio: 16 / 9,
+    backgroundColor: "#FFFDF4",
+    borderColor: "#9ACBD0",
+    borderWidth: 1,
+    overflow: "hidden",
+    padding: 18,
+    shadowColor: "#153A5B",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.10,
+    shadowRadius: 18,
+  },
+  deckSlideVisualImage: {
+    ...StyleSheet.absoluteFillObject,
+    opacity: 0.34,
+  },
+  deckSlideVisualWash: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: withAlpha("#FFFDF4", "B8"),
+  },
+  deckBlueprintGrid: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: withAlpha("#FFFDF4", "22"),
+    opacity: 0.62,
+  },
+  deckSlideHeader: {
+    alignItems: "center",
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginBottom: 8,
+  },
+  deckSlideSection: {
+    color: "#437487",
+    fontSize: 11,
+    fontWeight: "900",
+    letterSpacing: 1.2,
+    textTransform: "uppercase",
+  },
+  deckSlideNumber: {
+    color: "#C98706",
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  deckSlideTitle: {
+    color: "#153A5B",
+    fontSize: 26,
+    fontWeight: "900",
+    lineHeight: 30,
+    marginBottom: 6,
+  },
+  deckSlideThesis: {
+    color: "#354A57",
+    fontSize: 13,
+    fontWeight: "700",
+    lineHeight: 18,
+    marginBottom: 10,
+  },
+  deckNodeMap: {
+    alignItems: "center",
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    justifyContent: "center",
+    marginTop: 4,
+  },
+  deckNode: {
+    backgroundColor: "#F4FAF8",
+    borderColor: "#1B4965",
+    borderWidth: 1,
+    minWidth: "30%",
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  deckNodePrimary: {
+    backgroundColor: "#F4E0C8",
+    borderColor: "#C98706",
+  },
+  deckNodeLabel: {
+    color: "#153A5B",
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  deckNodeRole: {
+    color: "#4D6470",
+    fontSize: 10,
+    fontWeight: "700",
+    lineHeight: 14,
+    marginTop: 3,
+  },
+  deckPipeline: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: 6,
+    justifyContent: "center",
+    marginTop: 2,
+  },
+  deckStep: {
+    backgroundColor: "#F4FAF8",
+    borderColor: "#1B4965",
+    borderWidth: 1,
+    flex: 1,
+    minHeight: 62,
+    padding: 7,
+  },
+  deckStepLabel: {
+    color: "#153A5B",
+    fontSize: 11,
+    fontWeight: "900",
+  },
+  deckStepDetail: {
+    color: "#4D6470",
+    fontSize: 9,
+    fontWeight: "700",
+    lineHeight: 12,
+    marginTop: 3,
+  },
+  deckMatrix: {
+    borderColor: "#1B4965",
+    borderWidth: 1,
+    marginTop: 2,
+  },
+  deckMatrixRow: {
+    borderBottomColor: "#B9CAD0",
+    borderBottomWidth: 1,
+    flexDirection: "row",
+  },
+  deckMatrixLabel: {
+    backgroundColor: "#E8EEF0",
+    color: "#153A5B",
+    flex: 0.75,
+    fontSize: 10,
+    fontWeight: "900",
+    padding: 6,
+  },
+  deckMatrixCell: {
+    color: "#243F52",
+    flex: 1,
+    fontSize: 9,
+    fontWeight: "700",
+    lineHeight: 12,
+    padding: 6,
+  },
+  deckTextBlockGrid: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 7,
+    marginTop: 10,
+  },
+  deckTextBlock: {
+    backgroundColor: "#FFFDF4",
+    borderColor: "#C8D8DC",
+    borderWidth: 1,
+    flexGrow: 1,
+    flexBasis: "31%",
+    minHeight: 44,
+    padding: 8,
+  },
+  deckTextBlockKicker: {
+    color: "#C98706",
+    fontSize: 9,
+    fontWeight: "900",
+    marginBottom: 3,
+  },
+  deckTextBlockText: {
+    color: "#153A5B",
+    fontSize: 10,
+    fontWeight: "800",
+    lineHeight: 13,
+  },
+  deckNotesCard: {
+    backgroundColor: "#FFFDF9",
+    borderColor: "#E0D7C8",
+    borderRadius: 18,
+    borderWidth: 1,
+    padding: 16,
+  },
+  deckNotesKicker: {
+    color: "#C98706",
+    fontSize: 11,
+    fontWeight: "900",
+    letterSpacing: 1.4,
+    marginBottom: 8,
+  },
+  deckNotesText: {
+    color: palette.ink,
+    fontSize: 15,
+    fontWeight: "600",
+    lineHeight: 22,
+  },
+  deckLessonFooter: {
+    backgroundColor: withAlpha("#FFFDF9", "F4"),
+    borderTopColor: "#E7DDCF",
+    borderTopWidth: 1,
+    bottom: 0,
+    left: 0,
+    padding: 18,
+    position: "absolute",
+    right: 0,
   },
   detailScreenContent: {
     paddingHorizontal: 20,
@@ -6318,6 +7995,288 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: "600",
   },
+  webInputSafeArea: {
+    flex: 1,
+    backgroundColor: palette.background,
+  },
+  webInputScreen: {
+    flex: 1,
+    backgroundColor: palette.background,
+  },
+  webInputScroll: {
+    paddingHorizontal: 24,
+  },
+  webInputBackButton: {
+    alignSelf: "flex-start",
+    marginBottom: 28,
+    paddingVertical: 4,
+  },
+  webInputBackText: {
+    color: palette.teal,
+    fontSize: 19,
+    fontWeight: "800",
+  },
+  webInputTitle: {
+    color: palette.ink,
+    fontSize: 38,
+    fontWeight: "900",
+    lineHeight: 46,
+    marginBottom: 8,
+  },
+  webInputSubtitle: {
+    color: palette.muted,
+    fontSize: 18,
+    fontWeight: "700",
+    lineHeight: 26,
+    marginBottom: 28,
+  },
+  webInputLabel: {
+    color: "#8BA8BB",
+    fontSize: 16,
+    fontWeight: "900",
+    letterSpacing: 1.2,
+    marginBottom: 12,
+  },
+  webInputTextArea: {
+    backgroundColor: "#FFFFFF",
+    borderColor: palette.teal,
+    borderRadius: 18,
+    borderWidth: 2,
+    color: palette.ink,
+    fontSize: 21,
+    fontWeight: "600",
+    lineHeight: 34,
+    minHeight: 300,
+    maxHeight: 330,
+    paddingHorizontal: 18,
+    paddingTop: 20,
+    paddingBottom: 20,
+    marginBottom: 28,
+  },
+  webInputUploadRow: {
+    flexDirection: "row",
+    gap: 14,
+    marginBottom: 28,
+  },
+  webInputUploadBox: {
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    borderColor: withAlpha(palette.line, "EE"),
+    borderRadius: 18,
+    borderStyle: "dashed",
+    borderWidth: 2,
+    flex: 1,
+    justifyContent: "center",
+    minHeight: 122,
+    paddingHorizontal: 10,
+    paddingVertical: 18,
+  },
+  webInputUploadIcon: {
+    fontSize: 32,
+    marginBottom: 10,
+  },
+  webInputUploadTitle: {
+    color: palette.muted,
+    fontSize: 16,
+    fontWeight: "800",
+    marginBottom: 4,
+    textAlign: "center",
+  },
+  webInputUploadDesc: {
+    color: "#8BA8BB",
+    fontSize: 13,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  webInputError: {
+    marginTop: -16,
+    marginBottom: 22,
+  },
+  webInputErrorText: {
+    color: palette.danger,
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  webInputFormatRow: {
+    flexDirection: "row",
+    gap: 10,
+  },
+  webInputFormatCard: {
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    borderColor: palette.line,
+    borderRadius: 18,
+    borderWidth: 2,
+    flex: 1,
+    minHeight: 132,
+    paddingHorizontal: 8,
+    paddingVertical: 16,
+  },
+  webInputFormatCardActive: {
+    backgroundColor: withAlpha(palette.accentSoft, "45"),
+    borderColor: palette.accent,
+  },
+  webInputFormatIcon: {
+    fontSize: 32,
+    marginBottom: 10,
+  },
+  webInputFormatName: {
+    color: palette.ink,
+    fontSize: 16,
+    fontWeight: "900",
+    marginBottom: 6,
+    textAlign: "center",
+  },
+  webInputFormatNameActive: {
+    color: palette.ink,
+  },
+  webInputFormatDesc: {
+    color: "#8BA8BB",
+    fontSize: 13,
+    fontWeight: "700",
+    lineHeight: 18,
+    textAlign: "center",
+  },
+  webInputFooter: {
+    backgroundColor: palette.background,
+    bottom: 0,
+    left: 0,
+    paddingHorizontal: 24,
+    paddingTop: 12,
+    position: "absolute",
+    right: 0,
+  },
+  webInputGenerateButton: {
+    alignItems: "center",
+    backgroundColor: palette.ink,
+    borderRadius: 22,
+    minHeight: 72,
+    justifyContent: "center",
+    paddingHorizontal: 18,
+  },
+  webInputGenerateButtonDisabled: {
+    opacity: 0.45,
+  },
+  webInputGenerateButtonText: {
+    color: "#FFFFFF",
+    fontSize: 22,
+    fontWeight: "900",
+    textAlign: "center",
+  },
+  webGenSafeArea: {
+    flex: 1,
+    backgroundColor: palette.background,
+  },
+  webGenWrap: {
+    flex: 1,
+    alignItems: "center",
+    paddingHorizontal: 34,
+  },
+  webGenOrbOuter: {
+    alignItems: "center",
+    backgroundColor: withAlpha(palette.accentSoft, "75"),
+    borderRadius: 78,
+    height: 156,
+    justifyContent: "center",
+    marginBottom: 36,
+    width: 156,
+  },
+  webGenOrb: {
+    backgroundColor: palette.teal,
+    borderRadius: 60,
+    borderTopColor: palette.accent,
+    borderRightColor: palette.ink,
+    borderBottomColor: palette.teal,
+    borderLeftColor: palette.accent,
+    borderWidth: 58,
+    height: 120,
+    width: 120,
+  },
+  webGenTitle: {
+    color: palette.ink,
+    fontSize: 30,
+    fontWeight: "900",
+    marginBottom: 8,
+    textAlign: "center",
+  },
+  webGenSubtitle: {
+    color: palette.muted,
+    fontSize: 18,
+    fontWeight: "700",
+    marginBottom: 54,
+    textAlign: "center",
+  },
+  webGenSteps: {
+    alignSelf: "stretch",
+    gap: 12,
+  },
+  webGenStep: {
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    borderColor: palette.line,
+    borderRadius: 18,
+    borderWidth: 2,
+    flexDirection: "row",
+    minHeight: 92,
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+  },
+  webGenStepDone: {
+    borderColor: withAlpha(palette.success, "55"),
+    backgroundColor: withAlpha("#F5FFF3", "F0"),
+  },
+  webGenStepNow: {
+    borderColor: palette.teal,
+  },
+  webGenStepIcon: {
+    fontSize: 30,
+    marginRight: 18,
+    width: 38,
+  },
+  webGenStepTextWrap: {
+    flex: 1,
+  },
+  webGenStepName: {
+    color: palette.ink,
+    fontSize: 19,
+    fontWeight: "900",
+    marginBottom: 3,
+  },
+  webGenStepDesc: {
+    color: palette.muted,
+    fontSize: 15,
+    fontWeight: "700",
+    lineHeight: 21,
+  },
+  webGenStepDescNow: {
+    color: palette.teal,
+  },
+  webGenStepGlyph: {
+    color: palette.ink,
+    fontSize: 22,
+    fontWeight: "900",
+    marginLeft: 12,
+  },
+  webGenErrorCard: {
+    alignSelf: "stretch",
+    backgroundColor: withAlpha(palette.danger, "12"),
+    borderColor: withAlpha(palette.danger, "55"),
+    borderRadius: 18,
+    borderWidth: 1,
+    marginTop: 16,
+    padding: 16,
+  },
+  webGenErrorTitle: {
+    color: palette.danger,
+    fontSize: 16,
+    fontWeight: "900",
+    marginBottom: 4,
+  },
+  webGenErrorBody: {
+    color: palette.danger,
+    fontSize: 14,
+    lineHeight: 20,
+  },
   swipeableWrapper: {
     overflow: "hidden",
     borderRadius: 28,
@@ -6765,9 +8724,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 18,
   },
-  ideaRowLocked: {
-    opacity: 0.78,
-  },
   ideaRowLeft: {
     alignItems: "center",
     flex: 1,
@@ -6790,9 +8746,6 @@ const styles = StyleSheet.create({
     color: palette.ink,
     fontSize: 18,
     fontWeight: "800",
-  },
-  ideaRowTitleLocked: {
-    color: withAlpha(palette.ink, "B0"),
   },
   ideaRowDuration: {
     color: palette.ink,
@@ -7463,7 +9416,7 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
   },
   shortFullscreenRoot: {
-    backgroundColor: "#050505",
+    backgroundColor: "#FFFDF4",
     flex: 1,
   },
   shortPlayerStage: {
@@ -7471,24 +9424,39 @@ const styles = StyleSheet.create({
     paddingTop: 0,
   },
   shortPlayerShell: {
-    backgroundColor: "#050505",
+    backgroundColor: "#FFFDF4",
     flex: 1,
     overflow: "hidden",
     position: "relative",
   },
   shortPlayerMediaTapZone: {
     flex: 1,
+    position: "relative",
   },
   shortPlayerVideo: {
     backgroundColor: "#050505",
     flex: 1,
     width: "100%",
   },
+  shortSceneSlideFrame: {
+    backgroundColor: "#FFFDF4",
+    left: 0,
+    overflow: "hidden",
+    position: "absolute",
+    right: 0,
+  },
   shortPlayerStillFrame: {
     backgroundColor: "#050505",
     flex: 1,
     overflow: "hidden",
     position: "relative",
+  },
+  shortPlayerLoadingStage: {
+    alignItems: "center",
+    backgroundColor: "#050505",
+    flex: 1,
+    justifyContent: "center",
+    width: "100%",
   },
   shortPlayerStillBackdrop: {
     ...StyleSheet.absoluteFillObject,
@@ -7500,13 +9468,13 @@ const styles = StyleSheet.create({
   },
   shortPlayerPlaceholder: {
     alignItems: "center",
-    backgroundColor: "#050505",
+    backgroundColor: "#FFFDF4",
     flex: 1,
     justifyContent: "center",
     paddingHorizontal: 28,
   },
   shortPlayerPlaceholderText: {
-    color: "#FFF8EA",
+    color: "#153A5B",
     fontSize: 20,
     fontWeight: "800",
     textAlign: "center",
@@ -7514,8 +9482,10 @@ const styles = StyleSheet.create({
   shortPlayerCenterOverlay: {
     alignItems: "center",
     alignSelf: "center",
-    backgroundColor: withAlpha("#0E0907", "CC"),
+    backgroundColor: withAlpha("#FFFDF4", "EE"),
+    borderColor: withAlpha("#153A5B", "22"),
     borderRadius: 22,
+    borderWidth: 1,
     gap: 10,
     justifyContent: "center",
     left: 28,
@@ -7526,15 +9496,28 @@ const styles = StyleSheet.create({
     right: 28,
     top: "40%",
   },
+  shortPlayerAudioNotice: {
+    alignSelf: "center",
+    backgroundColor: withAlpha("#FFFDF4", "EA"),
+    borderColor: withAlpha("#153A5B", "22"),
+    borderRadius: 16,
+    borderWidth: 1,
+    left: 24,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    position: "absolute",
+    right: 24,
+  },
   shortPlayerOverlayText: {
-    color: "#FFF8EA",
+    color: "#153A5B",
     fontSize: 14,
     fontWeight: "700",
     textAlign: "center",
   },
   shortPlayerErrorText: {
-    color: "#FFF8EA",
+    color: "#153A5B",
     fontSize: 14,
+    fontWeight: "800",
     lineHeight: 21,
     textAlign: "center",
   },
@@ -7543,13 +9526,16 @@ const styles = StyleSheet.create({
     width: "100%",
   },
   shortPlayerQuizCtaWrap: {
-    bottom: 96,
+    bottom: 156,
     left: 20,
     position: "absolute",
     right: 20,
   },
   shortPlayerQuizCta: {
     minHeight: 54,
+    shadowOpacity: 0,
+    shadowRadius: 0,
+    elevation: 0,
   },
   shortClipSwipeHintWrap: {
     alignItems: "center",
@@ -7559,16 +9545,11 @@ const styles = StyleSheet.create({
     zIndex: 3,
   },
   shortClipSwipeHintText: {
-    backgroundColor: withAlpha("#090705", "C6"),
-    borderColor: withAlpha("#FFF8EA", "26"),
-    borderRadius: 999,
-    borderWidth: 1,
-    color: "#FFF8EA",
-    fontSize: 13,
-    fontWeight: "800",
-    overflow: "hidden",
-    paddingHorizontal: 14,
-    paddingVertical: 8,
+    color: "rgba(255,255,255,0.75)",
+    fontSize: 11,
+    fontWeight: "700",
+    letterSpacing: 0.5,
+    marginTop: 2,
     textAlign: "center",
   },
   shortPlayerBottomOverlay: {
@@ -7609,24 +9590,44 @@ const styles = StyleSheet.create({
     borderColor: "#FFF8EA",
   },
   shortSubtitleOverlay: {
-    alignItems: "center",
-    left: 16,
+    alignItems: "stretch",
+    left: 8,
     position: "absolute",
-    right: 16,
+    right: 8,
     zIndex: 2,
   },
   shortSubtitleText: {
     backgroundColor: withAlpha("#090705", "B8"),
     borderRadius: 14,
     color: "#FFF8EA",
-    fontSize: 16,
+    fontSize: 21,
     fontWeight: "800",
-    lineHeight: 22,
-    maxWidth: "84%",
+    lineHeight: 29,
+    width: "100%",
     overflow: "hidden",
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
     textAlign: "center",
+  },
+  shortTopTitleBar: {
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    borderBottomColor: "rgba(0,0,0,0.08)",
+    borderBottomWidth: 1,
+    flexDirection: "row",
+    gap: 6,
+    left: 0,
+    paddingHorizontal: 8,
+    position: "absolute",
+    right: 0,
+    top: 0,
+    zIndex: 6,
+  },
+  shortTopTitleText: {
+    color: "#0A0A0A",
+    flex: 1,
+    fontSize: 17,
+    fontWeight: "800",
   },
   shortTopOverlay: {
     alignItems: "center",
@@ -7637,6 +9638,85 @@ const styles = StyleSheet.create({
     right: 12,
     zIndex: 4,
   },
+  shortChapterChip: {
+    backgroundColor: withAlpha("#000000", "4D"),
+    borderRadius: 10,
+    maxWidth: 220,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  shortChapterChipTop: {
+    color: "#E8C66A",
+    fontSize: 11,
+    fontWeight: "900",
+  },
+  shortChapterChipSub: {
+    color: "#FFFFFF",
+    fontSize: 10,
+    fontWeight: "800",
+    marginTop: 1,
+  },
+  shortSpeedBar: {
+    backgroundColor: withAlpha("#000000", "55"),
+    borderRadius: 12,
+    flexDirection: "row",
+    padding: 3,
+  },
+  shortSpeedItem: {
+    borderRadius: 9,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+  },
+  shortSpeedItemOn: {
+    backgroundColor: "#E8C66A",
+  },
+  shortSpeedText: {
+    color: withAlpha("#FFFFFF", "CC"),
+    fontSize: 12,
+    fontWeight: "900",
+  },
+  shortSpeedTextOn: {
+    color: "#2B2104",
+  },
+  shortIdeaProgressOverlay: {
+    alignItems: "center",
+    justifyContent: "center",
+    left: 12,
+    position: "absolute",
+    right: 12,
+    zIndex: 4,
+  },
+  shortIdeaProgressTrack: {
+    flexDirection: "row",
+    gap: 4,
+    width: "100%",
+  },
+  shortIdeaProgressDot: {
+    backgroundColor: withAlpha("#FFFFFF", "40"),
+    borderRadius: 999,
+    flex: 1,
+    height: 5,
+  },
+  shortIdeaProgressDotDone: {
+    backgroundColor: withAlpha("#FFFFFF", "99"),
+  },
+  shortIdeaProgressDotCurrent: {
+    backgroundColor: "#E8C66A",
+    shadowColor: withAlpha("#E8C66A", "80"),
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 1,
+    shadowRadius: 8,
+  },
+  shortIdeaProgressLabel: {
+    color: "#0A0A0A",
+    fontSize: 12,
+    fontWeight: "900",
+    position: "absolute",
+    textAlign: "center",
+    textShadowColor: withAlpha("#FFFFFF", "CC"),
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 3,
+  },
   shortBackButton: {
     alignSelf: "flex-start",
     backgroundColor: "transparent",
@@ -7645,17 +9725,6 @@ const styles = StyleSheet.create({
     minWidth: 48,
     alignItems: "center",
     justifyContent: "center",
-  },
-  clipCounterBadge: {
-    backgroundColor: withAlpha("#000000", "55"),
-    borderRadius: 12,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-  },
-  clipCounterText: {
-    color: "#FFFFFF",
-    fontSize: 13,
-    fontWeight: "700",
   },
   shortActionRail: {
     position: "absolute",
@@ -7692,6 +9761,30 @@ const styles = StyleSheet.create({
     textShadowColor: withAlpha("#FFFDFA", "D8"),
     textShadowOffset: { width: 0, height: 0 },
     textShadowRadius: 8,
+  },
+  shortBottomTabBar: {
+    alignItems: "center",
+    backgroundColor: "#FFFFFF",
+    bottom: 0,
+    flexDirection: "row",
+    height: 60,
+    justifyContent: "space-around",
+    left: 0,
+    position: "absolute",
+    right: 0,
+    zIndex: 4,
+  },
+  shortBottomTabItem: {
+    alignItems: "center",
+    gap: 2,
+  },
+  shortBottomTabLabel: {
+    color: "rgba(10,10,10,0.45)",
+    fontSize: 10,
+    fontWeight: "700",
+  },
+  shortBottomTabLabelActive: {
+    color: "#0A0A0A",
   },
   shortSeekTrack: {
     height: 18,
@@ -7741,9 +9834,42 @@ const styles = StyleSheet.create({
   },
   shortQuizScreenContent: {
     gap: 18,
+    flexGrow: 1,
+    justifyContent: "center",
     paddingHorizontal: 20,
-    paddingTop: 18,
-    paddingBottom: 28,
+    paddingTop: 8,
+    paddingBottom: 34,
+  },
+  shortQuizShell: {
+    backgroundColor: palette.background,
+    flex: 1,
+  },
+  shortQuizTopBar: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: 10,
+    paddingHorizontal: 16,
+    paddingTop: 10,
+    paddingBottom: 8,
+  },
+  shortQuizBackButton: {
+    alignItems: "center",
+    backgroundColor: withAlpha("#FFFBF6", "E8"),
+    borderRadius: 999,
+    height: 44,
+    justifyContent: "center",
+    width: 44,
+  },
+  shortQuizBackButtonPlaceholder: {
+    height: 44,
+    width: 44,
+  },
+  shortQuizTopTitle: {
+    color: palette.ink,
+    flex: 1,
+    fontSize: 17,
+    fontWeight: "900",
+    textAlign: "center",
   },
   shortVideoShell: {
     backgroundColor: "#120A07",
@@ -8015,5 +10141,33 @@ const styles = StyleSheet.create({
   },
   shortQuizSection: {
     gap: 14,
+  },
+  shortQuizHeaderCard: {
+    alignItems: "center",
+    backgroundColor: withAlpha(palette.accentSoft, "55"),
+    borderColor: withAlpha(palette.accent, "33"),
+    borderRadius: 24,
+    borderWidth: 1,
+    flexDirection: "row",
+    gap: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+  },
+  shortQuizHeaderIcon: {
+    alignItems: "center",
+    backgroundColor: withAlpha("#FFFBF6", "D8"),
+    borderRadius: 999,
+    height: 42,
+    justifyContent: "center",
+    width: 42,
+  },
+  shortQuizHeaderText: {
+    flex: 1,
+    gap: 2,
+  },
+  shortQuizHeaderTitle: {
+    color: palette.ink,
+    fontSize: 18,
+    fontWeight: "900",
   },
 });

@@ -6,6 +6,7 @@ const {
   generatePackFromSource,
   splitSourceIntoChunks,
 } = require("../../shared/backend-core/dist/cjs/generation");
+const { enrichDeckPackWithImages } = require("../../shared/backend-core/dist/cjs/deckMedia");
 const {
   hasIdeaContext,
   normalizeIdeaContext,
@@ -122,6 +123,95 @@ test("generatePackFromSource still supports cards packs when explicitly requeste
   assert.ok(chunkCallCount >= 2);
   assert.equal(callSequence.at(-1), "pack_meta");
   assert.ok(result.pack.ideas.length >= 2);
+});
+
+test("generatePackFromSource creates visual deck packs when requested", async () => {
+  const result = await generatePackFromSource({
+    sourceText: "Chapter 1\nAI systems learn patterns from data and use models to infer useful answers.",
+    packFormat: "deck",
+    llmProvider: "gemini",
+    generateLLM: async ({ jsonSchema }) => {
+      assert.equal(jsonSchema?.name, "deck_pack");
+      return {
+        output_text: JSON.stringify({
+          title: "AI Blueprint",
+          subtitle: "A visual guide to AI systems",
+          author: "AI Studio",
+          category: "Technology",
+          description: "A blueprint-style deck about data, models, and inference.",
+          theme: "blueprint",
+          audience: "self-study learners",
+          slides: Array.from({ length: 4 }, (_, index) => ({
+            order: index + 1,
+            section: "AI systems",
+            title: `Slide ${index + 1}`,
+            thesis: "Data flows into a model, and the model produces an inference.",
+            layout: index === 0 ? "hero_blueprint" : "process_pipeline",
+            visualMetaphor: "A technical blueprint showing data moving through a model.",
+            textBlocks: [
+              { role: "headline", text: `Slide ${index + 1}` },
+              { role: "body", text: "Data, model, and inference each play a distinct role." },
+            ],
+            diagram: {
+              nodes: [
+                { id: "data", label: "Data", role: "raw input" },
+                { id: "model", label: "Model", role: "learned pattern" },
+              ],
+              edges: [{ from: "data", to: "model", label: "trained into" }],
+              steps: [
+                { label: "Data", detail: "examples enter the system" },
+                { label: "Model", detail: "patterns are represented" },
+                { label: "Inference", detail: "new answers are produced" },
+              ],
+              rows: [],
+            },
+            imagePrompt: "Blueprint-style non-text illustration of data flowing through a model.",
+            speakerNotes: "Explain how data, models, and inference connect.",
+          })),
+        }),
+      };
+    },
+  });
+
+  assert.equal(result.pack.format, "deck");
+  assert.equal(result.pack.slides.length, 4);
+  assert.equal(result.pack.ideas.length, 4);
+});
+
+test("enrichDeckPackWithImages marks deck visuals disabled when generation is off", async () => {
+  const pack = {
+    id: "deck-test",
+    format: "deck",
+    title: "Deck Test",
+    slides: [
+      {
+        id: "slide-1",
+        order: 1,
+        title: "Model Flow",
+        thesis: "Data becomes inference through a model.",
+        layout: "process_pipeline",
+        visualMetaphor: "A blueprint machine moving blocks through pipes.",
+        textBlocks: [{ role: "headline", text: "Model Flow" }],
+        diagram: {
+          nodes: [],
+          edges: [],
+          steps: [{ label: "Data", detail: "raw examples" }],
+          rows: [],
+        },
+        imagePrompt: "",
+        speakerNotes: "Explain the model flow.",
+      },
+    ],
+    ideas: [{ id: "slide-1", deckSlideId: "slide-1" }],
+  };
+
+  const enriched = await enrichDeckPackWithImages({
+    pack,
+    generateDeckImages: false,
+  });
+
+  assert.equal(enriched.slides[0].visual.imageStatus, "disabled");
+  assert.ok(enriched.slides[0].imagePrompt.includes("do NOT render readable text"));
 });
 
 test("generatePackFromSource creates a shorts pack with storyboard scenes and quiz by default", async () => {

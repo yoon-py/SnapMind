@@ -1,7 +1,16 @@
 const crypto = require("crypto");
 
-const { LLM_PROVIDER } = require("../config/generation");
+const {
+  GEMINI_API_KEY,
+  LLM_PROVIDER,
+  MEDIA_PROVIDER,
+  OPENAI_API_KEY,
+  OPENAI_IMAGE_MODEL,
+  OPENAI_TTS_MODEL,
+  OPENAI_TTS_VOICE,
+} = require("../config/generation");
 const { generateLLM } = require("./llm");
+const { getUserFromAuthHeader, sendGenerationNotification } = require("./pushNotifications");
 const {
   assessExtractedTextQuality,
   extractSourceTextFromUpload,
@@ -11,6 +20,7 @@ const {
 } = require("./sourceExtraction");
 
 const { generatePackFromSource, detectSourceLanguage } = require("../../shared/backend-core/dist/cjs/generation");
+const { enrichDeckPackWithImages } = require("../../shared/backend-core/dist/cjs/deckMedia");
 const { createSignedShortAudioUrl, enrichShortsPackWithAudio } = require("../../shared/backend-core/dist/cjs/shortsMedia");
 const { normalizeSourceMaterialText, trimText } = require("../../shared/backend-core/dist/cjs/text");
 
@@ -27,16 +37,15 @@ function createGenerationHandlers({ jobStore }) {
     const title = trimText(request.body?.title, "");
     const author = trimText(request.body?.author, "");
     const category = trimText(request.body?.category, "");
-    const packFormat = trimText(request.body?.packFormat, "shorts") === "cards" ? "cards" : "shorts";
-
-    let sourceText = normalizeSourceMaterialText(request.body?.sourceText);
-    let geminiFileBuffer = null;
-    let geminiFileMimeType = null;
-
-    const canFallbackToGeminiMultimodal =
-      LLM_PROVIDER === "gemini" &&
-      request.file &&
-      isImageUpload(request.file);
+    const requestedFormat = trimText(request.body?.packFormat, "shorts");
+    const requestedExtractionMode = trimText(request.body?.extractionMode, "auto");
+    const extractionMode = ["auto", "pdf-parser", "upstage-ocr"].includes(requestedExtractionMode)
+      ? requestedExtractionMode
+      : "auto";
+    const skipMedia = String(request.body?.skipMedia || "").trim() === "1";
+    const packFormat = ["cards", "shorts", "deck"].includes(requestedFormat) ? requestedFormat : "shorts";
+    const notificationUser = await getUserFromAuthHeader(request).catch(() => null);
+    const notificationUserId = notificationUser?.id || null;
 
     if (request.file) {
       if (!isSupportedUpload(request.file)) {
@@ -45,67 +54,11 @@ function createGenerationHandlers({ jobStore }) {
         });
         return;
       }
-
-      let extractedText = "";
-      let extractionError = null;
-
-      try {
-        extractedText = await extractSourceTextFromUpload(request.file);
-      } catch (error) {
-        extractionError = error;
-      }
-
-      const hasMeaningfulExtractedText =
-        extractedText && isExtractedTextMeaningful(extractedText) && assessExtractedTextQuality(extractedText).ok;
-
-      if (hasMeaningfulExtractedText) {
-        sourceText = extractedText;
-      } else if (canFallbackToGeminiMultimodal) {
-        geminiFileBuffer = request.file.buffer;
-        geminiFileMimeType = request.file.mimetype || "application/octet-stream";
-        sourceText = "[file attached for multimodal processing]";
-        console.warn(
-          `[gemini] Falling back to direct multimodal generation because text extraction was insufficient: ${
-            extractionError?.message || "low-quality extracted text"
-          }`
-        );
-      } else {
-        response.status(400).json({
-          error: "Could not extract enough readable text from the uploaded file.",
-          details: extractionError?.message || "Extracted text was too short or garbled.",
-        });
-        return;
-      }
-    }
-
-    if (!sourceText || !trimText(sourceText, "")) {
+    } else if (!normalizeSourceMaterialText(request.body?.sourceText)) {
       response.status(400).json({
-        error: request.file
-          ? "The PDF did not contain extractable text. Please upload a text-based PDF."
-          : "Please provide source text.",
+        error: "Please provide source text.",
       });
       return;
-    }
-
-    if (!geminiFileBuffer) {
-      if (request.file && !isExtractedTextMeaningful(sourceText)) {
-        response.status(400).json({
-          error: "The uploaded file contained almost no readable text. It may be an image-based PDF that could not be processed. Please try a different file.",
-        });
-        return;
-      }
-
-      if (request.file) {
-        const quality = assessExtractedTextQuality(sourceText);
-        if (!quality.ok) {
-          const message =
-            quality.reason === "garbled"
-              ? "파일에서 텍스트를 추출했지만 내용이 깨져서 읽을 수 없습니다. 텍스트 기반 PDF 또는 TXT 파일로 다시 시도해 주세요."
-              : "파일에서 읽을 수 있는 텍스트가 없습니다. 다른 파일로 시도해 주세요.";
-          response.status(400).json({ error: message });
-          return;
-        }
-      }
     }
 
     const jobId = crypto.randomUUID();
@@ -114,6 +67,78 @@ function createGenerationHandlers({ jobStore }) {
 
     (async () => {
       try {
+        let sourceText = normalizeSourceMaterialText(request.body?.sourceText);
+        let geminiFileBuffer = null;
+        let geminiFileMimeType = null;
+
+        const canFallbackToModelFileInput =
+          ["gemini", "openai"].includes(LLM_PROVIDER) &&
+          request.file &&
+          extractionMode === "auto";
+
+        if (request.file) {
+          await applyPatch(job, { step: "extracting text", totalChunks: 1, completedChunks: 0 });
+
+          let extractedText = "";
+          let extractionError = null;
+
+          try {
+            extractedText = await extractSourceTextFromUpload(request.file, { extractionMode });
+          } catch (error) {
+            extractionError = error;
+          }
+
+          const hasMeaningfulExtractedText =
+            extractedText && isExtractedTextMeaningful(extractedText) && assessExtractedTextQuality(extractedText).ok;
+
+          if (hasMeaningfulExtractedText) {
+            sourceText = extractedText;
+          } else if (canFallbackToModelFileInput) {
+            geminiFileBuffer = request.file.buffer;
+            geminiFileMimeType = request.file.mimetype || "application/octet-stream";
+            sourceText = "[file attached for multimodal processing]";
+            console.warn(
+              `[${LLM_PROVIDER}] Falling back to direct file input because text extraction was insufficient: ${
+                extractionError?.message || "low-quality extracted text"
+              }`
+            );
+          } else {
+            throw new Error(
+              extractionError?.message ||
+                "이미지 기반 PDF(스캔본)는 텍스트 추출이 불가합니다. UPSTAGE_API_KEY 또는 Google Document AI OCR 설정을 확인해 주세요."
+            );
+          }
+
+          await applyPatch(job, { completedChunks: 1 });
+        }
+
+        if (!sourceText || !trimText(sourceText, "")) {
+          throw new Error(
+            request.file
+              ? "The uploaded file did not contain extractable text."
+              : "Please provide source text."
+          );
+        }
+
+        if (!geminiFileBuffer) {
+          if (request.file && !isExtractedTextMeaningful(sourceText)) {
+            throw new Error(
+              "The uploaded file contained almost no readable text. It may be an image-based PDF that could not be processed. Please try a different file."
+            );
+          }
+
+          if (request.file) {
+            const quality = assessExtractedTextQuality(sourceText);
+            if (!quality.ok) {
+              throw new Error(
+                quality.reason === "garbled"
+                  ? "파일에서 텍스트를 추출했지만 내용이 깨져서 읽을 수 없습니다. 텍스트 기반 PDF 또는 TXT 파일로 다시 시도해 주세요."
+                  : "파일에서 읽을 수 있는 텍스트가 없습니다. 다른 파일로 시도해 주세요."
+              );
+            }
+          }
+        }
+
         const result = await generatePackFromSource({
           title,
           author,
@@ -127,16 +152,34 @@ function createGenerationHandlers({ jobStore }) {
           onProgress: async (patch) => applyPatch(job, patch),
         });
 
+        if (skipMedia) {
+          job.status = "done";
+          job.pack = result.pack;
+          job.debug = result.debug;
+          await sendGenerationNotification({
+            userId: notificationUserId,
+            title: "SnapMind",
+            body: `"${result.pack?.title || title || "학습팩"}" 생성이 끝났어요.`,
+            data: { type: "generation_done", jobId, packId: result.pack?.id || null },
+          }).catch((error) => console.warn("Push notification failed:", error?.message || error));
+          jobStore.scheduleCleanup(jobId);
+          return;
+        }
+
         const packWithAudio = await enrichShortsPackWithAudio({
           pack: result.pack,
           ttsConfig: {
-            apiKey: process.env.GEMINI_API_KEY,
-            model: process.env.GEMINI_TTS_MODEL,
-            voiceName: process.env.GEMINI_TTS_VOICE,
+            provider: MEDIA_PROVIDER,
+            apiKey: MEDIA_PROVIDER === "openai" ? OPENAI_API_KEY : GEMINI_API_KEY,
+            model: MEDIA_PROVIDER === "openai" ? OPENAI_TTS_MODEL : process.env.GEMINI_TTS_MODEL,
+            voiceName: MEDIA_PROVIDER === "openai" ? OPENAI_TTS_VOICE : process.env.GEMINI_TTS_VOICE,
           },
           imageConfig: {
-            apiKey: process.env.GEMINI_API_KEY,
-            model: process.env.GEMINI_IMAGE_MODEL,
+            provider: "openai",
+            apiKey: OPENAI_API_KEY,
+            model: OPENAI_IMAGE_MODEL,
+            size: process.env.OPENAI_IMAGE_SIZE || "1024x1792",
+            quality: process.env.OPENAI_IMAGE_QUALITY || "low",
           },
           storageConfig: {
             supabaseUrl: process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL,
@@ -147,14 +190,47 @@ function createGenerationHandlers({ jobStore }) {
           onProgress: async (patch) => applyPatch(job, patch),
         });
 
+        const packWithMedia = await enrichDeckPackWithImages({
+          pack: packWithAudio,
+          imageConfig: {
+            provider: MEDIA_PROVIDER,
+            apiKey: MEDIA_PROVIDER === "openai" ? OPENAI_API_KEY : GEMINI_API_KEY,
+            model: MEDIA_PROVIDER === "openai" ? OPENAI_IMAGE_MODEL : process.env.GEMINI_IMAGE_MODEL,
+            size: "1536x1024",
+            quality: process.env.OPENAI_IMAGE_QUALITY || "low",
+          },
+          storageConfig: {
+            supabaseUrl: process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL,
+            serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+            bucketName:
+              process.env.SUPABASE_IMAGE_BUCKET ||
+              process.env.SUPABASE_AUDIO_BUCKET ||
+              "shorts-audio",
+          },
+          generateDeckImages: process.env.DECK_GENERATE_IMAGES === "1",
+          onProgress: async (patch) => applyPatch(job, patch),
+        });
+
         job.status = "done";
-        job.pack = packWithAudio;
+        job.pack = packWithMedia;
         job.debug = result.debug;
+        await sendGenerationNotification({
+          userId: notificationUserId,
+          title: "SnapMind",
+          body: `"${packWithMedia?.title || title || "학습팩"}" 생성이 끝났어요.`,
+          data: { type: "generation_done", jobId, packId: packWithMedia?.id || null },
+        }).catch((error) => console.warn("Push notification failed:", error?.message || error));
         jobStore.scheduleCleanup(jobId);
       } catch (error) {
         console.error("Generation failed:", error);
         job.status = "error";
         job.error = error.message || "Failed to generate a pack from the source.";
+        await sendGenerationNotification({
+          userId: notificationUserId,
+          title: "SnapMind",
+          body: "학습팩 생성에 실패했어요. 앱에서 다시 시도해 주세요.",
+          data: { type: "generation_error", jobId },
+        }).catch((pushError) => console.warn("Push notification failed:", pushError?.message || pushError));
         jobStore.scheduleCleanup(jobId);
       }
     })();

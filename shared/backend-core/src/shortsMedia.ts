@@ -11,6 +11,14 @@ import {
   generateShortSceneImage,
   resolveGeminiImageConfig,
 } from "./geminiImage";
+import {
+  resolveOpenAITextToSpeechConfig,
+  synthesizeShortAudioWithOpenAI,
+} from "./openaiTextToSpeech";
+import {
+  generateOpenAIImage,
+  resolveOpenAIImageConfig,
+} from "./openaiImage";
 import { slugify, trimText } from "./text";
 
 export function buildShortAudioPath(packId: string, ideaId: string, extension = "wav") {
@@ -72,10 +80,14 @@ export async function enrichShortsPackWithAudio({
     apiKey?: string;
     model?: string;
     voiceName?: string;
+    provider?: string;
   };
   imageConfig?: {
     apiKey?: string;
     model?: string;
+    provider?: string;
+    size?: string;
+    quality?: string;
   };
   storageConfig?: {
     supabaseUrl?: string;
@@ -90,9 +102,19 @@ export async function enrichShortsPackWithAudio({
     return pack;
   }
 
-  const resolvedTtsConfig = resolveGeminiTextToSpeechConfig(ttsConfig || {});
-  const resolvedImageConfig = resolveGeminiImageConfig(imageConfig || {});
+  const ttsProvider = trimText(ttsConfig?.provider, "gemini").toLowerCase();
+  const imageProvider = trimText(imageConfig?.provider, ttsProvider).toLowerCase();
+  const useOpenAITts = ttsProvider === "openai";
+  const useOpenAIImages = imageProvider === "openai";
+  const resolvedTtsConfig = useOpenAITts
+    ? resolveOpenAITextToSpeechConfig(ttsConfig || {})
+    : resolveGeminiTextToSpeechConfig(ttsConfig || {});
+  const resolvedImageConfig = useOpenAIImages
+    ? resolveOpenAIImageConfig({ ...(imageConfig || {}), size: imageConfig?.size || "1024x1792" })
+    : resolveGeminiImageConfig(imageConfig || {});
   const resolvedStorageConfig = resolveSupabaseAudioStorageConfig(storageConfig || {});
+  const ttsProviderLabel = useOpenAITts ? "openai-tts" : "gemini-tts";
+  const imageProviderLabel = useOpenAIImages ? "openai-image" : "gemini-image";
 
   if (!resolvedStorageConfig) {
     return {
@@ -103,7 +125,7 @@ export async function enrichShortsPackWithAudio({
           ...clip,
           tts: {
             ...(clip?.tts || {}),
-            provider: "gemini-tts",
+            provider: ttsProviderLabel,
             audioStatus: "failed",
           },
         })),
@@ -112,7 +134,7 @@ export async function enrichShortsPackWithAudio({
               ...getIdeaShortClips(idea)[0],
               tts: {
                 ...(getIdeaShortClips(idea)[0]?.tts || {}),
-                provider: "gemini-tts",
+                provider: ttsProviderLabel,
                 audioStatus: "failed",
               },
             }
@@ -120,7 +142,7 @@ export async function enrichShortsPackWithAudio({
               ...(idea.short || {}),
               tts: {
                 ...(idea.short?.tts || {}),
-                provider: "gemini-tts",
+                provider: ttsProviderLabel,
                 audioStatus: "failed",
               },
             },
@@ -135,171 +157,258 @@ export async function enrichShortsPackWithAudio({
   );
   await onProgress?.({ step: "voicing", totalChunks: totalClipCount, completedChunks: 0 });
 
-  const ideas = [];
+  const CLIP_CONCURRENCY = Math.max(
+    1,
+    Number(process.env.SHORTS_CLIP_CONCURRENCY) || 4
+  );
+  const IMAGE_CONCURRENCY = Math.max(
+    1,
+    Number(process.env.SHORTS_IMAGE_CONCURRENCY) || 3
+  );
+
+  type ClipTask = {
+    ideaIndex: number;
+    clipIndex: number;
+    idea: any;
+    clip: any;
+  };
+
+  const clipTasks: ClipTask[] = [];
+  pack.ideas.forEach((idea: any, ideaIndex: number) => {
+    const rawClips = getIdeaShortClips(idea);
+    rawClips.forEach((clip: any, clipIndex: number) => {
+      clipTasks.push({ ideaIndex, clipIndex, idea, clip });
+    });
+  });
+
+  const enrichedClipsByIdea: any[][] = pack.ideas.map(() => []);
   let completedClipCount = 0;
 
-  for (let index = 0; index < pack.ideas.length; index += 1) {
-    const idea = pack.ideas[index];
-    const rawClips = getIdeaShortClips(idea);
-    const enrichedClips = [];
+  async function processScenesInParallel(
+    imagePlanScenes: any[],
+    idea: any,
+    clip: any,
+    clipIndex: number
+  ): Promise<any[]> {
+    if (!generateSceneImages || !resolvedImageConfig) {
+      return imagePlanScenes;
+    }
 
-    for (let clipIndex = 0; clipIndex < rawClips.length; clipIndex += 1) {
-      const clip = rawClips[clipIndex];
-      const clipScenes = Array.isArray(clip?.scenes) ? clip.scenes : [];
-      const imagePlanScenes = clipScenes.map((scene: any) => {
-        const imagePrompt = buildShortSceneImagePrompt({
-          packTitle: trimText(pack?.title, "Learning pack"),
-          ideaTitle: trimText(clip?.title || idea?.title, `Idea ${index + 1}`),
-          languageCode: trimText(pack?.languageCode, "en"),
-          scene: {
-            headline: scene?.headline,
-            body: scene?.body,
-            callouts: scene?.callouts,
-            visualStyle: scene?.visualStyle,
-            layoutHint: scene?.layoutHint,
-          },
-        });
+    const result: any[] = new Array(imagePlanScenes.length);
+    let nextIndex = 0;
 
-        return {
-          ...scene,
-          imagePrompt,
-          image: {
-            ...(scene?.image || {}),
-            provider: "gemini-image",
-            model: resolvedImageConfig?.model || trimText(imageConfig?.model, "gemini-3.1-flash-image-preview"),
-            imageStatus: generateSceneImages && resolvedImageConfig ? "pending" : "disabled",
-            imagePath: trimText(scene?.image?.imagePath, ""),
-            mimeType: trimText(scene?.image?.mimeType, ""),
-          },
-        };
-      });
-
-      try {
-        const scenes = clipScenes.map((scene: any, sceneIndex: number) => ({
-          id: trimText(scene?.id, `${idea.id}-clip-${clipIndex + 1}-scene-${sceneIndex + 1}`),
-          order: Math.max(1, Math.round(Number(scene?.order || sceneIndex + 1))),
-          narration: trimText(scene?.narration, scene?.body || ""),
-        }));
-
-        if (scenes.length === 0) {
-          throw new Error("No scenes available for TTS.");
+    async function worker() {
+      while (true) {
+        const sceneIndex = nextIndex;
+        nextIndex += 1;
+        if (sceneIndex >= imagePlanScenes.length) {
+          return;
         }
-
-        if (!resolvedTtsConfig) {
-          throw new Error("Gemini TTS is not configured.");
-        }
-
-        const audio = await synthesizeShortAudio({
-          config: resolvedTtsConfig,
-          scenes,
-          languageCode: pack.languageCode,
-          fetchImpl,
-        });
-        const audioPath = buildShortClipAudioPath(
-          pack.id,
-          idea.id,
-          trimText(clip?.id, `clip-${clipIndex + 1}`),
-          audio.fileExtension || "wav"
-        );
-        const uploadResult = await storage.uploadAudio(
-          audioPath,
-          audio.audioBytes,
-          audio.mimeType || "audio/wav"
-        );
-
-        let enrichedScenes = imagePlanScenes;
-        if (generateSceneImages && resolvedImageConfig) {
-          const nextScenes = [];
-
-          for (let sceneIndex = 0; sceneIndex < imagePlanScenes.length; sceneIndex += 1) {
-            const scene = imagePlanScenes[sceneIndex];
-            try {
-              const generatedImage = await generateShortSceneImage({
-                config: resolvedImageConfig,
+        const scene = imagePlanScenes[sceneIndex];
+        try {
+          const generatedImage = useOpenAIImages
+            ? await generateOpenAIImage({
+                config: resolvedImageConfig as any,
+                prompt: scene.imagePrompt,
+                size: imageConfig?.size || "1024x1792",
+                fetchImpl,
+              })
+            : await generateShortSceneImage({
+                config: resolvedImageConfig as any,
                 prompt: scene.imagePrompt,
                 fetchImpl,
               });
-              const imagePath = buildShortClipSceneImagePath(
-                pack.id,
-                idea.id,
-                trimText(clip?.id, `clip-${clipIndex + 1}`),
-                scene.id,
-                generatedImage.fileExtension
-              );
-              const imageUpload = await storage.uploadBinary(
-                imagePath,
-                generatedImage.imageBytes,
-                generatedImage.mimeType
-              );
-
-              nextScenes.push({
-                ...scene,
-                image: {
-                  ...(scene.image || {}),
-                  provider: "gemini-image",
-                  model: generatedImage.model,
-                  imageStatus: "ready",
-                  imagePath: imageUpload.path,
-                  bucketName: imageUpload.bucketName,
-                  mimeType: generatedImage.mimeType,
-                },
-              });
-            } catch (imageError: any) {
-              nextScenes.push({
-                ...scene,
-                image: {
-                  ...(scene.image || {}),
-                  provider: "gemini-image",
-                  model: resolvedImageConfig.model,
-                  imageStatus: "failed",
-                  errorMessage: imageError?.message || "Failed to generate scene image.",
-                },
-              });
-            }
-          }
-
-          enrichedScenes = nextScenes;
+          const imagePath = buildShortClipSceneImagePath(
+            pack.id,
+            idea.id,
+            trimText(clip?.id, `clip-${clipIndex + 1}`),
+            scene.id,
+            generatedImage.fileExtension
+          );
+          const imageUpload = await storage.uploadBinary(
+            imagePath,
+            generatedImage.imageBytes,
+            generatedImage.mimeType
+          );
+          result[sceneIndex] = {
+            ...scene,
+            image: {
+              ...(scene.image || {}),
+              provider: imageProviderLabel,
+              model: generatedImage.model,
+              imageStatus: "ready",
+              imagePath: imageUpload.path,
+              bucketName: imageUpload.bucketName,
+              mimeType: generatedImage.mimeType,
+            },
+          };
+        } catch (imageError: any) {
+          result[sceneIndex] = {
+            ...scene,
+            image: {
+              ...(scene.image || {}),
+              provider: imageProviderLabel,
+              model: resolvedImageConfig!.model,
+              imageStatus: "failed",
+              errorMessage: imageError?.message || "Failed to generate scene image.",
+            },
+          };
         }
+      }
+    }
 
-        enrichedClips.push({
-          ...clip,
-          scenes: enrichedScenes,
-          tts: {
-            ...(clip?.tts || {}),
-            provider: "gemini-tts",
-            model: audio.model,
-            voice: audio.voiceLabel,
-            bucketName: uploadResult.bucketName,
-            audioPath: uploadResult.path,
-            durationMs: audio.durationMs,
-            audioStatus: "ready",
-            segments: audio.segments,
-          },
-        });
-      } catch (error: any) {
-        enrichedClips.push({
-          ...clip,
-          scenes: imagePlanScenes,
-          tts: {
-            ...(clip?.tts || {}),
-            provider: "gemini-tts",
-            model: resolvedTtsConfig?.model || trimText(ttsConfig?.model, "gemini-2.5-pro-preview-tts"),
-            audioStatus: "failed",
-            errorMessage: error?.message || "Failed to synthesize short audio.",
-          },
-        });
+    const workerCount = Math.min(IMAGE_CONCURRENCY, imagePlanScenes.length);
+    await Promise.all(Array.from({ length: workerCount }, worker));
+    return result;
+  }
+
+  async function processClip(task: ClipTask): Promise<any> {
+    const { ideaIndex, clipIndex, idea, clip } = task;
+    const clipScenes = Array.isArray(clip?.scenes) ? clip.scenes : [];
+    const imagePlanScenes = clipScenes.map((scene: any) => {
+      // 웹 brain이 심어둔 imagePrompt가 있으면 그대로 사용(웹 품질), 없으면 씬 필드로 생성
+      const imagePrompt = trimText(scene?.imagePrompt, "") || buildShortSceneImagePrompt({
+        packTitle: trimText(pack?.title, "Learning pack"),
+        ideaTitle: trimText(clip?.title || idea?.title, `Idea ${ideaIndex + 1}`),
+        languageCode: trimText(pack?.languageCode, "en"),
+        scene: {
+          headline: scene?.headline,
+          body: scene?.body,
+          callouts: scene?.callouts,
+          visualStyle: scene?.visualStyle,
+          layoutHint: scene?.layoutHint,
+        },
+      });
+
+      return {
+        ...scene,
+        imagePrompt,
+        image: {
+          ...(scene?.image || {}),
+          provider: imageProviderLabel,
+          model: resolvedImageConfig?.model || trimText(
+            imageConfig?.model,
+            useOpenAIImages ? "gpt-image-2" : "gemini-3.1-flash-image"
+          ),
+          imageStatus: generateSceneImages && resolvedImageConfig ? "pending" : "disabled",
+          imagePath: trimText(scene?.image?.imagePath, ""),
+          mimeType: trimText(scene?.image?.mimeType, ""),
+        },
+      };
+    });
+
+    try {
+      const scenes = clipScenes.map((scene: any, sceneIndex: number) => ({
+        id: trimText(scene?.id, `${idea.id}-clip-${clipIndex + 1}-scene-${sceneIndex + 1}`),
+        order: Math.max(1, Math.round(Number(scene?.order || sceneIndex + 1))),
+        narration: trimText(scene?.narration, scene?.body || ""),
+      }));
+
+      if (scenes.length === 0) {
+        throw new Error("No scenes available for TTS.");
       }
 
+      if (!resolvedTtsConfig) {
+        throw new Error(`${useOpenAITts ? "OpenAI" : "Gemini"} TTS is not configured.`);
+      }
+
+      const [audio, enrichedScenes] = await Promise.all([
+        (async () => {
+          const result = useOpenAITts
+            ? await synthesizeShortAudioWithOpenAI({
+                config: resolvedTtsConfig as any,
+                scenes,
+                languageCode: pack.languageCode,
+                fetchImpl,
+              })
+            : await synthesizeShortAudio({
+                config: resolvedTtsConfig as any,
+                scenes,
+                languageCode: pack.languageCode,
+                fetchImpl,
+              });
+          return result;
+        })(),
+        processScenesInParallel(imagePlanScenes, idea, clip, clipIndex),
+      ]);
+
+      const audioPath = buildShortClipAudioPath(
+        pack.id,
+        idea.id,
+        trimText(clip?.id, `clip-${clipIndex + 1}`),
+        audio.fileExtension || "wav"
+      );
+      const uploadResult = await storage.uploadAudio(
+        audioPath,
+        audio.audioBytes,
+        audio.mimeType || "audio/wav"
+      );
+
+      return {
+        ...clip,
+        scenes: enrichedScenes,
+        tts: {
+          ...(clip?.tts || {}),
+          provider: ttsProviderLabel,
+          model: audio.model,
+          voice: audio.voiceLabel,
+          bucketName: uploadResult.bucketName,
+          audioPath: uploadResult.path,
+          durationMs: audio.durationMs,
+          audioStatus: "ready",
+          segments: audio.segments,
+        },
+      };
+    } catch (error: any) {
+      console.error(
+        `[audio] clip ${clipIndex + 1} of idea ${ideaIndex + 1} failed:`,
+        error?.message || error
+      );
+      return {
+        ...clip,
+        scenes: imagePlanScenes,
+        tts: {
+          ...(clip?.tts || {}),
+          provider: ttsProviderLabel,
+          model: resolvedTtsConfig?.model || trimText(
+            ttsConfig?.model,
+            useOpenAITts ? "gpt-4o-mini-tts" : "gemini-2.5-pro-preview-tts"
+          ),
+          audioStatus: "failed",
+          errorMessage: error?.message || "Failed to synthesize short audio.",
+        },
+      };
+    }
+  }
+
+  let nextTaskIndex = 0;
+
+  async function clipWorker() {
+    while (true) {
+      const taskIndex = nextTaskIndex;
+      nextTaskIndex += 1;
+      if (taskIndex >= clipTasks.length) {
+        return;
+      }
+      const task = clipTasks[taskIndex];
+      const enrichedClip = await processClip(task);
+      enrichedClipsByIdea[task.ideaIndex][task.clipIndex] = enrichedClip;
       completedClipCount += 1;
       await onProgress?.({ completedChunks: completedClipCount });
     }
+  }
 
-    ideas.push({
+  const workerCount = Math.min(CLIP_CONCURRENCY, clipTasks.length);
+  await Promise.all(Array.from({ length: workerCount }, clipWorker));
+
+  const ideas = pack.ideas.map((idea: any, ideaIndex: number) => {
+    const enrichedClips = enrichedClipsByIdea[ideaIndex];
+    return {
       ...idea,
       clips: enrichedClips,
       short: enrichedClips[0] ? { ...enrichedClips[0] } : idea.short,
-    });
-  }
+    };
+  });
 
   return {
     ...pack,

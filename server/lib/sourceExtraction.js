@@ -3,7 +3,6 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-const { PDFParse } = require("pdf-parse");
 const mammoth = require("mammoth");
 const HWPDocument = require("hwp.js").default;
 const XLSX = require("xlsx");
@@ -121,7 +120,7 @@ async function extractTextFromPdfViaOcr(buffer, options = {}) {
     privateKeyId: process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY_ID,
     serviceAccountJson: process.env.GOOGLE_SERVICE_ACCOUNT_JSON,
   });
-  const ocrProvider = String(process.env.OCR_PROVIDER || "auto").toLowerCase();
+  const ocrProvider = String(options.provider || process.env.OCR_PROVIDER || "auto").toLowerCase();
   const canUseGoogleDocumentAi =
     (ocrProvider === "auto" || ocrProvider === "google_document_ai") &&
     googleConfig &&
@@ -183,7 +182,9 @@ async function extractTextFromPdfViaOcr(buffer, options = {}) {
       );
     }
 
-    throw new Error("UPSTAGE_API_KEY is missing. Cannot perform OCR.");
+    throw new Error(
+      "This PDF does not contain enough embedded text, so OCR is required. Set UPSTAGE_API_KEY or Google Document AI credentials to process scanned/image-based PDFs."
+    );
   }
 
   console.log("OCR: using Upstage Document Parse API...");
@@ -225,7 +226,7 @@ function isExtractedTextMeaningful(text) {
     .replace(/\s+/g, "")
     .trim();
 
-  return stripped.length >= 100;
+  return stripped.length >= 30;
 }
 
 function getMeaningfulTextLength(text) {
@@ -329,19 +330,37 @@ function assessExtractedTextQuality(text) {
   return { ok: true };
 }
 
-async function extractSourceTextFromPdf(file) {
+async function extractSourceTextFromPdf(file, options = {}) {
+  const { PDFParse } = require("pdf-parse");
   const parser = new PDFParse({ data: file.buffer });
+  const extractionMode = String(options.extractionMode || "auto").toLowerCase();
   let totalPages;
+  let parsedText = "";
+  let parsedCoverage = null;
+  let fallbackReason = "";
+
+  if (extractionMode === "upstage-ocr") {
+    return extractTextFromPdfViaOcr(file.buffer, { provider: "upstage" });
+  }
 
   try {
     const result = await parser.getText();
     totalPages = result.total;
     const text = normalizeSourceMaterialText(result.text);
+    parsedText = text;
     const coverage = assessPdfTextCoverage({
       text,
       totalPages: result.total,
       pages: result.pages,
     });
+    parsedCoverage = coverage;
+
+    if (extractionMode === "pdf-parser") {
+      console.log(
+        `PDF: extracted ${text.length} chars via pdf-parse only (${coverage.meaningfulPages}/${coverage.totalPages} meaningful pages)`
+      );
+      return text;
+    }
 
     if (isExtractedTextMeaningful(text) && !coverage.suspicious) {
       console.log(
@@ -350,18 +369,41 @@ async function extractSourceTextFromPdf(file) {
       return text;
     }
 
-    const fallbackReason = coverage.suspicious
+    fallbackReason = coverage.suspicious
       ? coverage.reasons.join("; ")
       : "PDF text extraction yielded little content";
 
-    console.log(`${fallbackReason}, falling back to Upstage OCR...`);
+    console.log(
+      `${fallbackReason}; pdf-parse extracted ${text.length} chars, falling back to OCR...`
+    );
   } catch (error) {
-    console.log(`PDF text extraction failed (${error.message}), falling back to Upstage OCR...`);
+    fallbackReason = `PDF text extraction failed (${error.message})`;
+    if (extractionMode === "pdf-parser") {
+      throw error;
+    }
+    console.log(`PDF text extraction failed (${error.message}), falling back to OCR...`);
   } finally {
     await parser.destroy().catch(() => {});
   }
 
-  return extractTextFromPdfViaOcr(file.buffer, { totalPages });
+  try {
+    return await extractTextFromPdfViaOcr(file.buffer, { totalPages });
+  } catch (ocrError) {
+    const quality = assessExtractedTextQuality(parsedText);
+    if (parsedText && isExtractedTextMeaningful(parsedText) && quality.ok) {
+      console.warn(
+        `OCR unavailable (${ocrError.message}). Using partial pdf-parse text (${parsedText.length} chars). Reason: ${fallbackReason}`
+      );
+      return parsedText;
+    }
+
+    if (parsedCoverage) {
+      console.warn(
+        `PDF parse fallback unusable: ${parsedText.length} chars; coverage=${JSON.stringify(parsedCoverage)}`
+      );
+    }
+    throw ocrError;
+  }
 }
 
 async function extractSourceTextFromDocx(file) {
@@ -477,8 +519,8 @@ async function extractSourceTextFromImage(file) {
   }
 }
 
-async function extractSourceTextFromUpload(file) {
-  if (isPdfUpload(file)) return extractSourceTextFromPdf(file);
+async function extractSourceTextFromUpload(file, options = {}) {
+  if (isPdfUpload(file)) return extractSourceTextFromPdf(file, options);
   if (isDocxUpload(file)) return extractSourceTextFromDocx(file);
   if (isHwpUpload(file)) return extractSourceTextFromHwp(file);
   if (isHwpxUpload(file)) return extractSourceTextFromHwpx(file);

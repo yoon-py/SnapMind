@@ -3,14 +3,9 @@ const {
   createSupabaseJobPersistence,
 } = require("../../shared/backend-core/dist/cjs/jobs");
 
-function createJobStore({ ttlMs = 5 * 60 * 1000 } = {}) {
-  const persistence = createSupabaseJobPersistence({
-    supabaseUrl: process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL,
-    serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
-  });
-
+function createJobStore({ ttlMs = 2 * 60 * 60 * 1000 } = {}) {
   return createPersistentJobStore({
-    persistence,
+    persistence: null,
     ttlMs,
   });
 }

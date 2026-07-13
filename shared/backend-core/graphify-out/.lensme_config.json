@@ -1,0 +1,9 @@
+{
+  "graph": "graphify-out/graph.json",
+  "prefix": "src/",
+  "root": ".",
+  "name": "backend-core",
+  "description": "",
+  "enrichment": "graphify-out/enrichment.json",
+  "output": "graphify-out/ontology.json"
+}

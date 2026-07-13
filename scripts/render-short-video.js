@@ -29,6 +29,21 @@ function escapeFilterPath(filePath) {
     .replace(/'/g, "\\'");
 }
 
+// Wrap caption text into a few short lines (Korean has few spaces, so wrap by char count).
+function wrapText(text, maxChars = 16, maxLines = 3) {
+  const clean = String(text || "").replace(/\s+/g, " ").trim();
+  if (!clean) return "";
+  const chars = [...clean];
+  const lines = [];
+  for (let i = 0; i < chars.length && lines.length < maxLines; i += maxChars) {
+    lines.push(chars.slice(i, i + maxChars).join(""));
+  }
+  if (chars.length > maxChars * maxLines && lines.length) {
+    lines[lines.length - 1] = `${[...lines[lines.length - 1]].slice(0, -1).join("")}…`;
+  }
+  return lines.join("\n");
+}
+
 function runFfmpeg(args) {
   const result = spawnSync(ffmpeg, args, {
     encoding: "utf8",
@@ -84,13 +99,37 @@ function getSceneDurationMs(scene, nextScene) {
   return Math.max(6000, Math.round(Number(scene?.estimatedSec || 10) * 1000));
 }
 
-function buildSceneFilter() {
-  return [
+function buildSceneFilter({ captionFile, creditFile } = {}) {
+  const parts = [
     `[0:v]scale=${DEFAULT_WIDTH}:${DEFAULT_HEIGHT}:force_original_aspect_ratio=increase,` +
       `crop=${DEFAULT_WIDTH}:${DEFAULT_HEIGHT},boxblur=36:8[bg]`,
     `[0:v]scale=${DEFAULT_WIDTH}:${DEFAULT_HEIGHT}:force_original_aspect_ratio=decrease[fg]`,
-    `[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=${DEFAULT_FPS},format=yuv420p[v]`,
-  ].join(";");
+    `[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps=${DEFAULT_FPS}[base]`,
+  ];
+
+  let last = "base";
+  const font = escapeFilterPath(DEFAULT_FONT_FILE);
+
+  if (captionFile) {
+    parts.push(
+      `[${last}]drawtext=fontfile='${font}':textfile='${escapeFilterPath(captionFile)}':` +
+        `fontcolor=white:fontsize=52:line_spacing=12:box=1:boxcolor=black@0.55:boxborderw=28:` +
+        `x=(w-text_w)/2:y=h-text_h-220[cap]`
+    );
+    last = "cap";
+  }
+
+  if (creditFile) {
+    parts.push(
+      `[${last}]drawtext=fontfile='${font}':textfile='${escapeFilterPath(creditFile)}':` +
+        `fontcolor=white@0.9:fontsize=28:box=1:boxcolor=black@0.45:boxborderw=10:` +
+        `x=w-text_w-32:y=h-text_h-48[cred]`
+    );
+    last = "cred";
+  }
+
+  parts.push(`[${last}]format=yuv420p[v]`);
+  return parts.join(";");
 }
 
 function main() {
@@ -140,6 +179,20 @@ function main() {
       const durationSec = Math.max(1.6, durationMs / 1000);
       const clipPath = path.join(workingDir, `scene-${String(index + 1).padStart(2, "0")}.mp4`);
 
+      const captionText = wrapText(scene?.headline || scene?.media?.caption || "");
+      const creditText = String(scene?.media?.credit || "").trim();
+
+      let captionFile = "";
+      let creditFile = "";
+      if (captionText) {
+        captionFile = path.join(workingDir, `caption-${String(index + 1).padStart(2, "0")}.txt`);
+        fs.writeFileSync(captionFile, captionText, "utf8");
+      }
+      if (creditText) {
+        creditFile = path.join(workingDir, `credit-${String(index + 1).padStart(2, "0")}.txt`);
+        fs.writeFileSync(creditFile, `ⓒ ${creditText}`, "utf8");
+      }
+
       runFfmpeg([
         "-y",
         "-loop",
@@ -147,7 +200,7 @@ function main() {
         "-i",
         imagePath,
         "-filter_complex",
-        buildSceneFilter(),
+        buildSceneFilter({ captionFile, creditFile }),
         "-map",
         "[v]",
         "-t",

@@ -55,7 +55,10 @@ export function createSupabaseAudioStorageClient(config: SupabaseAudioStorageCon
         ) {
           throw createError;
         }
-      })();
+      })().catch((err) => {
+        ensureBucketPromise = null;
+        throw err;
+      });
     }
 
     return ensureBucketPromise;

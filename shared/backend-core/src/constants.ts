@@ -262,6 +262,19 @@ export const LENGTH_LIMITS = {
   sceneLayoutHint: 120,
   sceneMotionHint: 120,
   sceneTransitionHint: 120,
+  slideTextField: 140,
+  slideBullet: 90,
+  deckTheme: 40,
+  deckAudience: 120,
+  deckSlideTitle: 120,
+  deckSlideThesis: 260,
+  deckSlideLayout: 60,
+  deckVisualMetaphor: 260,
+  deckTextBlock: 240,
+  deckDiagramLabel: 80,
+  deckDiagramNote: 180,
+  deckImagePrompt: 1200,
+  deckSpeakerNotes: 900,
   ttsProvider: 24,
   ttsVoice: 64,
   ttsAudioPath: 240,
@@ -299,8 +312,34 @@ export const IDEA_CHAT_LIMITS = {
   sceneTransitionHint: 100,
 } as const;
 
-export const CHUNK_CHAR_THRESHOLD = 4500;
-export const CHUNK_TARGET_SIZE = 3000;
+export const CHUNK_CHAR_THRESHOLD = 500000;
+export const CHUNK_TARGET_SIZE = 500000;
+
+const MODEL_CONTEXT_CHARS: Record<string, number> = {
+  // Gemini 1M context (~750K chars, reserve ~50K for prompt+output)
+  "gemini-2.5-pro": 700000,
+  "gemini-2.5-flash": 700000,
+  "gemini-2.0-flash": 700000,
+  "gemini-1.5-pro": 700000,
+  "gemini-1.5-flash": 700000,
+  "gemini-3-flash": 700000,
+  "gemini-3-pro": 700000,
+  // OpenAI
+  "gpt-4o": 80000,
+  "gpt-4.1": 700000,
+  "gpt-4-turbo": 100000,
+  "gpt-3.5-turbo": 12000,
+};
+
+export function getChunkSizeForModel(modelId: string): number {
+  const normalized = modelId.toLowerCase();
+  for (const [key, size] of Object.entries(MODEL_CONTEXT_CHARS)) {
+    if (normalized.includes(key)) return size;
+  }
+  // 모르는 모델은 안전하게 작게
+  if (normalized.includes("gemini")) return 700000;
+  return 80000;
+}
 
 export const chunkIdeasSchema = {
   type: "object",
@@ -341,6 +380,50 @@ export const chunkIdeasSchema = {
                 title: { type: "string", maxLength: LENGTH_LIMITS.lessonTitle },
                 body: { type: "string", maxLength: LENGTH_LIMITS.lessonBody },
                 support: { type: "string", maxLength: LENGTH_LIMITS.lessonSupport },
+                cardType: {
+                  type: "string",
+                  enum: ["concept", "comparison", "diagram", "interactive", "recall", "quiz", "source_image", "free_image"],
+                },
+                media: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    kind: { type: "string", enum: ["none", "source_image", "free_image", "ai_image"] },
+                    query: { type: "string", maxLength: 160 },
+                    caption: { type: "string", maxLength: 180 },
+                    imagePrompt: { type: "string", maxLength: 500 },
+                  },
+                },
+                diagram: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    kind: { type: "string", enum: ["none", "comparison", "flow", "formula", "graph", "matrix", "layers"] },
+                    title: { type: "string", maxLength: 80 },
+                    labels: { type: "array", maxItems: 6, items: { type: "string", maxLength: 40 } },
+                    expression: { type: "string", maxLength: 120 },
+                  },
+                },
+                interaction: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    kind: { type: "string", enum: ["none", "flip", "toggle", "slider", "order", "fill_blank"] },
+                    prompt: { type: "string", maxLength: 180 },
+                    options: { type: "array", maxItems: 5, items: { type: "string", maxLength: 80 } },
+                    answer: { type: "string", maxLength: 120 },
+                  },
+                },
+                check: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    question: { type: "string", maxLength: LENGTH_LIMITS.practiceQuestion },
+                    options: { type: "array", minItems: 2, maxItems: 4, items: { type: "string", maxLength: LENGTH_LIMITS.practiceOption } },
+                    correctIndex: { type: "integer", minimum: 0, maximum: 3 },
+                    explanation: { type: "string", maxLength: LENGTH_LIMITS.practiceExplanation },
+                  },
+                },
               },
             },
           },
@@ -539,6 +622,50 @@ export const packSchema = {
                 title: { type: "string", maxLength: LENGTH_LIMITS.lessonTitle },
                 body: { type: "string", maxLength: LENGTH_LIMITS.lessonBody },
                 support: { type: "string", maxLength: LENGTH_LIMITS.lessonSupport },
+                cardType: {
+                  type: "string",
+                  enum: ["concept", "comparison", "diagram", "interactive", "recall", "quiz", "source_image", "free_image"],
+                },
+                media: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    kind: { type: "string", enum: ["none", "source_image", "free_image", "ai_image"] },
+                    query: { type: "string", maxLength: 160 },
+                    caption: { type: "string", maxLength: 180 },
+                    imagePrompt: { type: "string", maxLength: 500 },
+                  },
+                },
+                diagram: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    kind: { type: "string", enum: ["none", "comparison", "flow", "formula", "graph", "matrix", "layers"] },
+                    title: { type: "string", maxLength: 80 },
+                    labels: { type: "array", maxItems: 6, items: { type: "string", maxLength: 40 } },
+                    expression: { type: "string", maxLength: 120 },
+                  },
+                },
+                interaction: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    kind: { type: "string", enum: ["none", "flip", "toggle", "slider", "order", "fill_blank"] },
+                    prompt: { type: "string", maxLength: 180 },
+                    options: { type: "array", maxItems: 5, items: { type: "string", maxLength: 80 } },
+                    answer: { type: "string", maxLength: 120 },
+                  },
+                },
+                check: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    question: { type: "string", maxLength: LENGTH_LIMITS.practiceQuestion },
+                    options: { type: "array", minItems: 2, maxItems: 4, items: { type: "string", maxLength: LENGTH_LIMITS.practiceOption } },
+                    correctIndex: { type: "integer", minimum: 0, maximum: 3 },
+                    explanation: { type: "string", maxLength: LENGTH_LIMITS.practiceExplanation },
+                  },
+                },
               },
             },
           },
@@ -639,7 +766,7 @@ export const shortIdeaStoryboardSchema = {
         properties: {
           title: { type: "string", maxLength: LENGTH_LIMITS.ideaTitle },
           teaser: { type: "string", maxLength: LENGTH_LIMITS.teaser },
-          durationSec: { type: "integer", minimum: 25, maximum: 90 },
+          durationSec: { type: "integer", minimum: 30, maximum: 120 },
           hook: { type: "string", maxLength: LENGTH_LIMITS.shortHook },
           learningGoal: { type: "string", maxLength: LENGTH_LIMITS.shortLearningGoal },
           targetPlatform: { type: "string", maxLength: LENGTH_LIMITS.shortTargetPlatform },
@@ -663,10 +790,6 @@ export const shortIdeaStoryboardSchema = {
                 "callouts",
                 "captionLines",
                 "emphasisWords",
-                "visualStyle",
-                "layoutHint",
-                "motionHint",
-                "transitionHint",
                 "estimatedSec",
               ],
               properties: {
@@ -761,6 +884,153 @@ export const shortsPackMetaSchema = {
       minItems: 3,
       maxItems: 3,
       items: { type: "string", maxLength: LENGTH_LIMITS.coverLine },
+    },
+  },
+};
+
+export const deckPackSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "title",
+    "subtitle",
+    "author",
+    "category",
+    "description",
+    "theme",
+    "audience",
+    "slides",
+  ],
+  properties: {
+    title: { type: "string", maxLength: LENGTH_LIMITS.packTitle },
+    subtitle: { type: "string", maxLength: LENGTH_LIMITS.subtitle },
+    author: { type: "string", maxLength: LENGTH_LIMITS.author },
+    category: { type: "string", maxLength: LENGTH_LIMITS.category },
+    description: { type: "string", maxLength: LENGTH_LIMITS.description },
+    theme: { type: "string", maxLength: LENGTH_LIMITS.deckTheme },
+    audience: { type: "string", maxLength: LENGTH_LIMITS.deckAudience },
+    slides: {
+      type: "array",
+      minItems: 4,
+      maxItems: 18,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "order",
+          "section",
+          "title",
+          "thesis",
+          "layout",
+          "visualMetaphor",
+          "textBlocks",
+          "diagram",
+          "imagePrompt",
+          "speakerNotes",
+        ],
+        properties: {
+          order: { type: "integer", minimum: 1, maximum: 18 },
+          section: { type: "string", maxLength: 80 },
+          title: { type: "string", maxLength: LENGTH_LIMITS.deckSlideTitle },
+          thesis: { type: "string", maxLength: LENGTH_LIMITS.deckSlideThesis },
+          layout: {
+            type: "string",
+            enum: [
+              "hero_blueprint",
+              "concept_map",
+              "process_pipeline",
+              "comparison_matrix",
+              "layered_model",
+              "architecture_blueprint",
+              "three_cards",
+              "data_story",
+            ],
+          },
+          visualMetaphor: { type: "string", maxLength: LENGTH_LIMITS.deckVisualMetaphor },
+          textBlocks: {
+            type: "array",
+            minItems: 2,
+            maxItems: 8,
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["role", "text"],
+              properties: {
+                role: {
+                  type: "string",
+                  enum: ["kicker", "headline", "body", "callout", "label", "stat"],
+                },
+                text: { type: "string", maxLength: LENGTH_LIMITS.deckTextBlock },
+                emphasis: { type: "string", maxLength: LENGTH_LIMITS.deckDiagramLabel },
+              },
+            },
+          },
+          diagram: {
+            type: "object",
+            additionalProperties: false,
+            required: ["nodes", "edges", "steps", "rows"],
+            properties: {
+              nodes: {
+                type: "array",
+                maxItems: 10,
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["id", "label", "role"],
+                  properties: {
+                    id: { type: "string", maxLength: 48 },
+                    label: { type: "string", maxLength: LENGTH_LIMITS.deckDiagramLabel },
+                    role: { type: "string", maxLength: LENGTH_LIMITS.deckDiagramNote },
+                  },
+                },
+              },
+              edges: {
+                type: "array",
+                maxItems: 12,
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["from", "to", "label"],
+                  properties: {
+                    from: { type: "string", maxLength: 48 },
+                    to: { type: "string", maxLength: 48 },
+                    label: { type: "string", maxLength: LENGTH_LIMITS.deckDiagramLabel },
+                  },
+                },
+              },
+              steps: {
+                type: "array",
+                maxItems: 7,
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["label", "detail"],
+                  properties: {
+                    label: { type: "string", maxLength: LENGTH_LIMITS.deckDiagramLabel },
+                    detail: { type: "string", maxLength: LENGTH_LIMITS.deckDiagramNote },
+                  },
+                },
+              },
+              rows: {
+                type: "array",
+                maxItems: 6,
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["label", "left", "right"],
+                  properties: {
+                    label: { type: "string", maxLength: LENGTH_LIMITS.deckDiagramLabel },
+                    left: { type: "string", maxLength: LENGTH_LIMITS.deckDiagramNote },
+                    right: { type: "string", maxLength: LENGTH_LIMITS.deckDiagramNote },
+                  },
+                },
+              },
+            },
+          },
+          imagePrompt: { type: "string", maxLength: LENGTH_LIMITS.deckImagePrompt },
+          speakerNotes: { type: "string", maxLength: LENGTH_LIMITS.deckSpeakerNotes },
+        },
+      },
     },
   },
 };
