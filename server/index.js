@@ -670,10 +670,6 @@ function createApp() {
   app.post("/api/idea-chat", createIdeaChatHandler());
   app.use("/auth", createAuthRouter({ sessionStore: authSessionStore }));
 
-  app.get("/demo", (_request, response) => {
-    response.sendFile(require("path").resolve(__dirname, "../demo.html"));
-  });
-
   app.post("/api/extract-text", upload.single("file"), async (request, response) => {
     if (!request.file) { response.status(400).json({ error: "file required" }); return; }
     try {
@@ -991,8 +987,12 @@ Return ONLY valid JSON. No explanation, no markdown.
   const distPath = path.join(__dirname, "../web/dist");
   app.use(express.static(distPath));
 
-  // SPA fallback for frontend routing, excluding api and auth paths
-  app.get("*", (request, response, next) => {
+  // SPA fallback for frontend routing, excluding api and auth paths.
+  // Express 5 no longer accepts "*" as a route pattern, so use middleware.
+  app.use((request, response, next) => {
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return next();
+    }
     if (request.path.startsWith("/api") || request.path.startsWith("/auth")) {
       return next();
     }

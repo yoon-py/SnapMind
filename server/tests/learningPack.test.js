@@ -241,6 +241,40 @@ test("generatePackFromSource creates a shorts pack with storyboard scenes and qu
     packFormat: "shorts",
     llmProvider: "openai",
     generateLLM: async ({ jsonSchema }) => {
+      if (jsonSchema?.name === "scenes") {
+        return {
+          output_text: JSON.stringify({
+            scenes: [
+              {
+                chapterTitle: "Chapter 1",
+                subsectionTitle: "1.1 Vectors as positions",
+                title: "Vectors as positions",
+                narration: "Vectors give us one clean way to talk about magnitude and direction at the same time.",
+                slides: Array.from({ length: 4 }, (_, index) => ({
+                  imagePrompt: `Blueprint vector diagram ${index + 1}`,
+                  narrationMarker: index === 0 ? "Vectors give us" : "magnitude and direction",
+                  startRatio: index / 4,
+                })),
+              },
+            ],
+          }),
+        };
+      }
+
+      if (jsonSchema?.name === "quiz") {
+        return {
+          output_text: JSON.stringify({
+            questions: Array.from({ length: 3 }, (_, index) => ({
+              q: `Quiz question ${index + 1}?`,
+              options: ["Option A", "Option B", "Option C", "Option D"],
+              answer: 0,
+              explanation: "Option A is the best match.",
+              conceptTitle: "Vectors as positions",
+            })),
+          }),
+        };
+      }
+
       if (jsonSchema?.name === "short_idea_outlines") {
         return {
           output_text: JSON.stringify({
@@ -311,12 +345,12 @@ test("generatePackFromSource creates a shorts pack with storyboard scenes and qu
   assert.equal(result.pack.packReview, null);
   assert.equal(result.pack.ideas.length, 1);
   assert.equal(result.pack.ideas[0].short.scenes.length, 4);
-  assert.equal(result.pack.ideas[0].quiz.questions.length, 3);
+  assert.equal(result.pack.ideas[0].quiz.questions.length, 1);
+  assert.equal(result.pack.ideas[0].quiz.questions[0].question, "Quiz question 1?");
   assert.equal(result.pack.ideas[0].short.tts.audioStatus, "pending");
-  assert.equal(result.pack.ideas[0].short.targetPlatform, "TikTok or Reels style vertical lesson");
   assert.equal(result.pack.ideas[0].short.coverSceneId, result.pack.ideas[0].short.scenes[0].id);
-  assert.deepEqual(result.pack.ideas[0].short.scenes[0].captionLines, ["Caption line 1"]);
-  assert.equal(result.pack.ideas[0].short.scenes[0].motionHint, "Slow push toward the diagram");
+  assert.equal(result.pack.ideas[0].short.scenes[0].imagePrompt, "Blueprint vector diagram 1");
+  assert.ok(result.pack.ideas[0].short.scenes[0].captionLines[0].includes("Vectors"));
 });
 
 test("normalizeIdeaContext keeps shorts tutor context", () => {

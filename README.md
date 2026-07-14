@@ -28,7 +28,8 @@ PDF, Word, HWP, PPT, 이미지 등 다양한 형식의 문서를 업로드하면
 | 인증/DB | Supabase (Auth + PostgreSQL + Storage) |
 | OCR | Google Document AI · Upstage (폴백) |
 | 문서 파싱 | pdf-parse · mammoth · hwp.js · xlsx · officeparser |
-| 실험적 엣지 백엔드 | Cloudflare Workers |
+| 웹 프론트엔드 | Vite + React |
+| 배포 | Fly.io (Express API + Vite 정적 파일) |
 
 ## 프로젝트 구조
 
@@ -55,8 +56,11 @@ PDF, Word, HWP, PPT, 이미지 등 다양한 형식의 문서를 업로드하면
 │   ├── routes/auth.js      # Google OAuth 콜백
 │   └── stores/             # 인메모리 작업/세션 저장소
 │
-├── shared/backend-core/    # 서버 + 워커 공유 TypeScript 코어
-├── worker/                 # Cloudflare Worker 실험용 백엔드
+├── web/                    # Vite 웹 앱. Fly 배포 시 web/dist로 빌드됨
+├── shared/backend-core/    # 서버에서 사용하는 공용 TypeScript 코어
+├── ios/                    # Expo prebuild iOS 프로젝트
+├── Dockerfile              # Fly.io 배포 이미지
+├── fly.toml                # Fly.io 앱 설정
 └── supabase-schema.sql     # DB 스키마
 ```
 
